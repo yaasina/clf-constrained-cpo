@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+.mypy_cache/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pt
+!*/models/*.pt  # Keep saved models for reference/later use
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+venv*/
+.conda/
+
+# VS Code
+.vscode/
+*.code-workspace
+.history/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+*.iws
+out/
+.idea_modules/
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+dynamics_results*/
+clf_results*/
+!dynamics_results/models/*.pt
+!clf_results/models/*.pt
+configs/
+logs/
+tensorboard_logs/
+*.log
+outputs/
+
+# Exclude large data files
+data/*.npy
+data/*.npz
+data/*.hdf5
+data/*.h5
+
+# Allow keeping empty directories with .gitkeep
+!.gitkeep
+0.1.5
