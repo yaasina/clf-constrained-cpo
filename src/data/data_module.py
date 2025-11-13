@@ -206,14 +206,11 @@ class CLFDataset(Dataset):
             idx: Index of the sample
             
         Returns:
-            Dictionary containing states and optionally dynamics_model
+            Dictionary containing states (the dynamics model is stored at the dataset level)
         """
         sample = {
             "states": self.states[idx]
         }
-        
-        if self.dynamics_model is not None:
-            sample["dynamics_model"] = self.dynamics_model
             
         return sample
     

@@ -1,0 +1,15 @@
+# Dynamics Ensemble Model Configuration
+_target_: src.models.dynamics.DynamicsEnsembleLightning
+# Dimensions will be inferred from data during training
+hidden_dim: 64
+ensemble_size: 5
+dropout_rate: 0.1
+mc_dropout_samples: 20
+mc_dropout_enabled: false  # Default is false to disable MC dropout during inference
+learning_rate: 0.001
+
+# Variance normalization parameters
+static_norm_k: 2.0  # Scaling parameter for static normalization: 1-exp(-k*var)
+dynamic_norm_c0: 0.01  # Initial value for dynamic normalization parameter
+dynamic_norm_alpha: 0.01  # Learning rate for dynamic normalization parameter update
+variance_buffer_size: 1000  # Size of the buffer for variance history

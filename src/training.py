@@ -22,6 +22,27 @@ from models.clf import CLFNetworkLightning
 from solvers.clf_qp_solver import CLFQPSolverLightning
 from data.data_module import DynamicsDataModule, CLFDataModule
 
+# Import gym for environment handling
+import gymnasium as gym
+from gymnasium.spaces import Box, Discrete
+
+def get_space_dimension(space):
+    """
+    Get the dimension of a gym space.
+    
+    Args:
+        space: Gym space (Box, Discrete, etc.)
+        
+    Returns:
+        Dimension of the space
+    """
+    if isinstance(space, Box):
+        return int(np.prod(space.shape))
+    elif isinstance(space, Discrete):
+        return 1
+    else:
+        raise ValueError(f"Unsupported space type: {type(space)}")
+
 
 def set_seed(seed: int) -> None:
     """
@@ -101,7 +122,6 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
     # Initialize environment if using environment data
     env = None
     if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
-        import gymnasium as gym
         from data_collection import collect_trajectory, process_trajectory
         
         print(f"Setting up environment: {config.experiment.env_name}")
@@ -186,10 +206,15 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
         
         # Initialize model if first trajectory
         if model is None:
-            # Get a batch to determine dimensions
-            batch = next(iter(data_module.train_dataloader()))
-            state_dim = batch["states"].shape[1]
-            action_dim = batch["actions"].shape[1]
+            if env is not None:
+                # Use environment spaces to determine dimensions
+                state_dim = get_space_dimension(env.observation_space)
+                action_dim = get_space_dimension(env.action_space)
+            else:
+                # Get a batch to determine dimensions
+                batch = next(iter(data_module.train_dataloader()))
+                state_dim = batch["states"].shape[1]
+                action_dim = batch["actions"].shape[1]
             
             # Update the config with the inferred dimensions
             config_dict = OmegaConf.to_container(config.model, resolve=True)
@@ -293,6 +318,41 @@ def train_clf_model(
         group=config.logger.group
     )
     
+    # Initialize environment to collect states
+    env = None
+    states = None
+    if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
+        from data_collection import collect_trajectory, process_trajectory
+        
+        print(f"Setting up environment for CLF training: {config.experiment.env_name}")
+        env = gym.make(config.experiment.env_name)
+        
+        # Collect trajectories to generate state samples for CLF training
+        num_trajectories = config.experiment.data.get('num_trajectories', 5)
+        traj_length = config.experiment.data.get('traj_length', 50)
+        
+        trajectory_buffer = []
+        
+        # Collect trajectories
+        for traj_idx in range(num_trajectories):
+            print(f"\n=== Collecting trajectory {traj_idx+1}/{num_trajectories} for CLF training ===")
+            
+            # Collect a new trajectory
+            new_trajectory = collect_trajectory(
+                env, 
+                length=traj_length, 
+                random_seed=config.seed + traj_idx
+            )
+            
+            trajectory_buffer.append(new_trajectory)
+        
+        # Process trajectories to get states
+        states, _, _ = process_trajectory(trajectory_buffer)
+        print(f"Generated dataset for CLF training: {states.shape[0]} state samples")
+        
+        # Clean up environment
+        env.close()
+    
     # Extract only the parameters that CLFDataModule accepts
     data_module_params = {
         "_target_": CLFDataModule,
@@ -301,7 +361,8 @@ def train_clf_model(
         "normalize": config.experiment.dynamics.get("normalize_data", True),
         "random_seed": config.seed,
         "dynamics_model": dynamics_model,
-        "persistent_workers": config.experiment.data.get("persistent_workers", False)
+        "persistent_workers": config.experiment.data.get("persistent_workers", False),
+        "states": states  # Add the collected states
     }
     
     # If data paths are specified, add them
@@ -527,19 +588,258 @@ def main(config: DictConfig) -> Dict[str, Any]:
             eval_results = evaluate_control_policy(config, clf_model, dynamics_model)
             results["control_evaluation"] = eval_results
     
-    # Run full pipeline
+    # Run full pipeline - alternating dynamics and CLF training
     elif config.experiment.task == "full_pipeline":
-        # Train dynamics model
-        dynamics_model, dynamics_results = train_dynamics_model(config)
-        results["dynamics"] = dynamics_results
+        # Initialize environment if using environment data
+        env = None
+        if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
+            from data_collection import collect_trajectory, process_trajectory
+            
+            print(f"Setting up environment: {config.experiment.env_name}")
+            env = gym.make(config.experiment.env_name)
+        else:
+            raise ValueError("Environment name must be provided for full pipeline")
         
-        # Train CLF model using the trained dynamics model
-        clf_model, clf_results = train_clf_model(config, dynamics_model)
-        results["clf"] = clf_results
+        # Get configuration parameters
+        num_trajectories = config.experiment.data.get('num_trajectories', 5)
+        traj_length = config.experiment.data.get('traj_length', 50)
+        buffer_size = config.experiment.data.get('buffer_size', 3)
+        epochs_per_trajectory = config.experiment.data.get('epochs_per_trajectory', 5)
+        batch_size = config.experiment.training.get("batch_size", config.training.batch_size)
         
-        # Evaluate control policy
-        eval_results = evaluate_control_policy(config, clf_model, dynamics_model)
-        results["control_evaluation"] = eval_results
+        # Initialize trajectory buffer
+        trajectory_buffer = []
+        
+        # Initialize models
+        dynamics_model = None
+        clf_model = None
+        
+        # Initialize logger for dynamics
+        dynamics_logger = WandbLogger(
+            project=config.logger.project,
+            name=f"{config.logger.name}_dynamics",
+            save_dir=config.logger.save_dir,
+            log_model=config.logger.log_model,
+            notes=f"{config.logger.notes} - Dynamics",
+            tags=config.logger.tags + ["dynamics"],
+            group=config.logger.group
+        )
+        
+        # Initialize logger for CLF
+        clf_logger = WandbLogger(
+            project=config.logger.project,
+            name=f"{config.logger.name}_clf",
+            save_dir=config.logger.save_dir,
+            log_model=config.logger.log_model,
+            notes=f"{config.logger.notes} - CLF",
+            tags=config.logger.tags + ["clf"],
+            group=config.logger.group
+        )
+        
+        # Setup callbacks
+        dynamics_callbacks = setup_callbacks(config)
+        clf_callbacks = setup_callbacks(config)
+        
+        # Get sanity check configuration
+        num_sanity_val_steps = config.experiment.training.get("num_sanity_val_steps", 0)
+        
+        # Initialize counters
+        dynamics_epochs_trained = 0
+        clf_epochs_trained = 0
+        
+        # Train incrementally with each trajectory
+        for traj_idx in range(num_trajectories):
+            print(f"\n=== Collecting trajectory {traj_idx+1}/{num_trajectories} ===")
+            
+            # Collect a new trajectory
+            new_trajectory = collect_trajectory(
+                env, 
+                length=traj_length, 
+                random_seed=config.seed + traj_idx
+            )
+            
+            # Add to buffer using FIFO if buffer size is limited
+            trajectory_buffer.append(new_trajectory)
+            if len(trajectory_buffer) > buffer_size:
+                trajectory_buffer.pop(0)  # Remove oldest trajectory
+            
+            # Process all trajectories in buffer into a dataset
+            states, actions, next_states = process_trajectory(trajectory_buffer)
+            print(f"Dataset size after trajectory {traj_idx+1}: {states.shape[0]} samples")
+            
+            # ===== STEP 1: Train dynamics model on current trajectory buffer =====
+            dynamics_data_module = DynamicsDataModule(
+                states=states,
+                actions=actions,
+                next_states=next_states,
+                batch_size=batch_size,
+                num_workers=config.experiment.training.get("num_workers", 4),
+                normalize=config.experiment.dynamics.get("normalize_data", True),
+                random_seed=config.seed,
+                persistent_workers=config.experiment.data.get("persistent_workers", False),
+                train_ratio=config.experiment.data.get("train_ratio", 0.8),
+                val_ratio=config.experiment.data.get("val_ratio", 0.1),
+                test_ratio=config.experiment.data.get("test_ratio", 0.1)
+            )
+            dynamics_data_module.prepare_data()
+            dynamics_data_module.setup()
+            
+            # Initialize dynamics model if first trajectory
+            if dynamics_model is None:
+                if env is not None:
+                    # Use environment spaces to determine dimensions
+                    state_dim = get_space_dimension(env.observation_space)
+                    action_dim = get_space_dimension(env.action_space)
+                else:
+                    # Get a batch to determine dimensions
+                    batch = next(iter(dynamics_data_module.train_dataloader()))
+                    state_dim = batch["states"].shape[1]
+                    action_dim = batch["actions"].shape[1]
+                
+                # Update the config with the inferred dimensions
+                dynamics_config = OmegaConf.to_container(config.model, resolve=True)
+                dynamics_config.update({"state_dim": state_dim, "action_dim": action_dim})
+                dynamics_model_config = OmegaConf.create(dynamics_config)
+                
+                # Initialize dynamics model
+                dynamics_model = hydra.utils.instantiate(dynamics_model_config)
+                
+                # Log the inferred dimensions
+                dynamics_logger.experiment.config.update({
+                    "state_dim": state_dim,
+                    "action_dim": action_dim,
+                    "epochs_per_trajectory": epochs_per_trajectory,
+                    "buffer_size": buffer_size,
+                })
+                print(f"Inferred dimensions from data: state_dim={state_dim}, action_dim={action_dim}")
+            
+            # Configure dynamics trainer for this trajectory
+            dynamics_trainer = pl.Trainer(
+                accelerator=config.device.accelerator,
+                devices=config.device.devices,
+                max_epochs=dynamics_epochs_trained + epochs_per_trajectory,
+                min_epochs=dynamics_epochs_trained + 1,  # Ensure at least one epoch of training
+                logger=dynamics_logger,
+                callbacks=dynamics_callbacks,
+                gradient_clip_val=config.training.gradient_clip_val,
+                val_check_interval=config.training.val_check_interval,
+                precision=config.device.precision,
+                log_every_n_steps=config.experiment.training.get("log_every_n_steps", 2),
+                num_sanity_val_steps=num_sanity_val_steps if traj_idx == 0 else 0,
+            )
+            
+            # Train dynamics model on current dataset
+            print(f"Training dynamics model for {epochs_per_trajectory} epochs on trajectory {traj_idx+1}")
+            dynamics_trainer.fit(dynamics_model, dynamics_data_module)
+            
+            # Update dynamics epochs counter
+            dynamics_epochs_trained += epochs_per_trajectory
+            
+            # ===== STEP 2: Train CLF model using the updated dynamics model =====
+            clf_data_module = CLFDataModule(
+                states=states,
+                batch_size=batch_size,
+                dynamics_model=dynamics_model,  # Pass the updated dynamics model
+                num_workers=config.experiment.training.get("num_workers", 4),
+                normalize=config.experiment.dynamics.get("normalize_data", True),
+                random_seed=config.seed,
+                persistent_workers=config.experiment.data.get("persistent_workers", False),
+                train_ratio=config.experiment.data.get("train_ratio", 0.8),
+                val_ratio=config.experiment.data.get("val_ratio", 0.1),
+                test_ratio=config.experiment.data.get("test_ratio", 0.1)
+            )
+            clf_data_module.prepare_data()
+            clf_data_module.setup()
+            
+            # Initialize CLF model if first trajectory
+            if clf_model is None:
+                # Initialize config for CLF model
+                clf_config_dict = {
+                    "_target_": "src.models.clf.CLFNetworkLightning",
+                    "state_dim": state_dim,
+                    "hidden_dim": config.experiment.clf.get("hidden_dim", 64),
+                    "dropout_rate": 0.1,
+                    "learning_rate": 0.001
+                }
+                clf_model_config = OmegaConf.create(clf_config_dict)
+                
+                # Initialize CLF model
+                clf_model = hydra.utils.instantiate(clf_model_config)
+                
+                # Log CLF model config
+                clf_logger.experiment.config.update(clf_config_dict)
+            
+            # Configure CLF trainer for this trajectory
+            clf_trainer = pl.Trainer(
+                accelerator=config.device.accelerator,
+                devices=config.device.devices,
+                max_epochs=clf_epochs_trained + epochs_per_trajectory,
+                min_epochs=clf_epochs_trained + 1,  # Ensure at least one epoch of training
+                logger=clf_logger,
+                callbacks=clf_callbacks,
+                gradient_clip_val=config.training.gradient_clip_val,
+                val_check_interval=config.training.val_check_interval,
+                precision=config.device.precision,
+                log_every_n_steps=config.experiment.training.get("log_every_n_steps", 2),
+                num_sanity_val_steps=num_sanity_val_steps if traj_idx == 0 else 0,
+            )
+            
+            # Train CLF model using the current dataset and updated dynamics model
+            print(f"Training CLF model for {epochs_per_trajectory} epochs on trajectory {traj_idx+1}")
+            clf_trainer.fit(clf_model, clf_data_module)
+            
+            # Update CLF epochs counter
+            clf_epochs_trained += epochs_per_trajectory
+            
+            # Log trajectory completion
+            dynamics_logger.experiment.log({
+                "trajectory_completed": traj_idx + 1,
+                "total_epochs_trained": dynamics_epochs_trained
+            })
+            clf_logger.experiment.log({
+                "trajectory_completed": traj_idx + 1,
+                "total_epochs_trained": clf_epochs_trained
+            })
+        
+        # Test final models
+        print("\n=== Testing final dynamics model ===")
+        dynamics_test_results = dynamics_trainer.test(dynamics_model, dynamics_data_module)
+        
+        print("\n=== Testing final CLF model ===")
+        clf_test_results = clf_trainer.test(clf_model, clf_data_module)
+        
+        # Evaluate control policy if requested
+        if config.experiment.get("evaluate_control", False):
+            print("\n=== Evaluating control policy ===")
+            eval_results = evaluate_control_policy(config, clf_model, dynamics_model)
+            results["control_evaluation"] = eval_results
+        
+        # Store results
+        results["dynamics"] = {
+            "test_results": dynamics_test_results
+        }
+        results["clf"] = {
+            "test_results": clf_test_results
+        }
+        
+        # Log best model paths
+        for callback in dynamics_callbacks:
+            if isinstance(callback, ModelCheckpoint):
+                best_dynamics_path = callback.best_model_path
+                print(f"Best dynamics model path: {best_dynamics_path}")
+                dynamics_logger.experiment.summary["best_model_path"] = best_dynamics_path
+                results["dynamics"]["best_model_path"] = best_dynamics_path
+        
+        for callback in clf_callbacks:
+            if isinstance(callback, ModelCheckpoint):
+                best_clf_path = callback.best_model_path
+                print(f"Best CLF model path: {best_clf_path}")
+                clf_logger.experiment.summary["best_model_path"] = best_clf_path
+                results["clf"]["best_model_path"] = best_clf_path
+        
+        # Clean up environment
+        if env is not None:
+            env.close()
     
     else:
         raise ValueError(f"Unknown task: {config.experiment.task}")

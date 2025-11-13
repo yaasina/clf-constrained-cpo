@@ -1,0 +1,60 @@
+# Quick test configuration for CLF training with minimal data
+name: quick_test_clf
+description: "Quick test configuration with minimal trajectories for fast CLF learning"
+task: clf_training
+
+# Data configuration
+data:
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  random_seed: ${seed}
+  num_trajectories: 5      # Number of trajectories to sample for CLF training
+  traj_length: 50          # Length of each trajectory
+  buffer_size: 5           # Number of trajectories to keep in buffer
+  persistent_workers: true # Add persistent workers for faster data loading
+
+# Environment settings
+env_name: "Pendulum-v1"    # Using pendulum as the test environment
+state_dim: 3               # Pendulum state dimension
+action_dim: 1              # Pendulum action dimension
+
+# Load pre-trained dynamics model
+dynamics_model_path: "outputs/quick_test/2025-05-01/06-47-07/checkpoints/epoch_epoch=019.ckpt" # Path to our trained dynamics model
+
+# Dynamics-specific settings (needed for normalization compatibility)
+dynamics:
+  normalize_data: true
+  dt: 0.05                 # Time step for discrete integration
+  
+# CLF-specific settings
+clf:
+  hidden_dim: 64        # Size of hidden layers
+  lambda_derivative: 1.0 # Weight for derivative loss term
+  
+  # Self-supervised CLF loss hyperparameters
+  loss:
+    # Weight for minimizing CLF value at equilibrium: α₁V_θ(0)
+    alpha1: 1.0
+    
+    # Weight for minimizing relaxation variables: (α₂/B)∑ᵢr_i
+    alpha2: 1000
+    
+    # Weight for enforcing negative Lie derivatives: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0)
+    alpha3: 10.0
+    
+    # Weight for ensuring CLF decreases over time: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
+    alpha4: 10.0
+  
+  # QP solver parameters for evaluation
+  qp_solver:
+    lambda_param: 1.0
+    action_limits: [-5.0, 5.0]
+
+# Training overrides for faster execution
+training:
+  max_epochs: 50       # Number of epochs to train the CLF
+  batch_size: 64       # Smaller batch size
+  num_workers: 4       # Number of data loading workers
+  log_every_n_steps: 2 # Log more frequently for better tracking
+  num_sanity_val_steps: 0  # Completely disable sanity checks

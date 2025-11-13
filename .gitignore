@@ -68,7 +68,7 @@ dynamics_results*/
 clf_results*/
 !dynamics_results/models/*.pt
 !clf_results/models/*.pt
-configs/
+# configs/
 logs/
 tensorboard_logs/
 *.log

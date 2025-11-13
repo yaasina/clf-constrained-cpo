@@ -1,0 +1,75 @@
+# Quick test configuration for full pipeline (dynamics and CLF learning together)
+name: quick_test_full
+description: "Quick test configuration for incremental learning of dynamics and CLF together"
+task: full_pipeline
+
+# Data configuration
+data:
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  random_seed: ${seed}
+  num_trajectories: 2      # Number of trajectories to collect and learn from
+  traj_length: 50          # Length of each trajectory
+  buffer_size: 1           # Number of trajectories to keep in buffer (FIFO)
+  epochs_per_trajectory: 5 # Number of epochs to train on each trajectory
+  data_path: null          # Load from environment simulation
+  persistent_workers: true # Add persistent workers for faster data loading
+
+# Environment settings
+env_name: "Pendulum-v1"    # Using pendulum as the test environment
+# state_dim: 3               # Pendulum state dimension
+# action_dim: 1              # Pendulum action dimension
+
+# Dynamics-specific settings
+dynamics:
+  dt: 0.05                 # Time step for discrete integration
+  normalize_data: true
+  ensemble_size: 5         # Number of models in ensemble
+  hidden_dim: 64           # Size of hidden layers
+  mc_dropout_enabled: false # Explicitly disable MC dropout during inference
+  
+  # Variance normalization parameters
+  static_norm_k: 2.0       # Scaling parameter for static normalization: 1-exp(-k*var)
+  dynamic_norm_c0: 0.01    # Initial value for dynamic normalization parameter
+  dynamic_norm_alpha: 0.01 # Learning rate for dynamic normalization parameter update
+  variance_buffer_size: 1000 # Size of the buffer for variance history
+
+# CLF-specific settings
+clf:
+  hidden_dim: 64           # Size of hidden layers
+  lambda_derivative: 1.0   # Weight for derivative loss term
+  
+  # Self-supervised CLF loss hyperparameters
+  loss:
+    # Weight for minimizing CLF value at equilibrium: α₁V_θ(0)
+    alpha1: 1.0
+    
+    # Weight for minimizing relaxation variables: (α₂/B)∑ᵢr_i
+    alpha2: 1000
+    
+    # Weight for enforcing negative Lie derivatives: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0)
+    alpha3: 10
+    
+    # Weight for ensuring CLF decreases over time: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
+    alpha4: 10
+  
+  # QP solver parameters for evaluation
+  qp_solver:
+    lambda_param: 1.0
+    action_limits: [-5.0, 5.0]
+    # action_dim: 1          # Add the missing action_dim parameter
+
+# Evaluation settings
+evaluate_control: true     # Evaluate the control policy after training
+eval_grid: true           # Use a grid of states for evaluation (better for visualization)
+n_eval_samples: 400       # Number of samples for evaluation
+visualize_admissible_controls: true  # Visualize admissible control sets
+
+# Training overrides for faster execution
+training:
+  max_epochs: 50           # Max epochs for CLF training
+  batch_size: 32           # Smaller batch size
+  num_workers: 4           # Number of data loading workers
+  log_every_n_steps: 1     # Log more frequently for better tracking of progress
+  num_sanity_val_steps: 0  # Completely disable sanity checks to speed up workflow

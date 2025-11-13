@@ -24,7 +24,7 @@ class CLFQPSolverLightning(pl.LightningModule):
     
     def __init__(
         self, 
-        action_dim: int,
+        action_dim: int = None,  # Can be determined dynamically from environment
         action_limits: Tuple[float, float] = (-5.0, 5.0),
         lambda_param: float = 1.0, 
         exp_const: float = 1.0,
@@ -35,7 +35,7 @@ class CLFQPSolverLightning(pl.LightningModule):
         Initialize the QP optimizer.
         
         Args:
-            action_dim: Dimension of the action space
+            action_dim: Dimension of the action space (if None, determined from environment or dynamics model)
             action_limits: Tuple of (lower, upper) bounds for actions
             lambda_param: Weight on the relaxation variable in the objective function
             exp_const: Exponential constant for the Lyapunov function decrease rate
@@ -46,7 +46,7 @@ class CLFQPSolverLightning(pl.LightningModule):
         
         self.save_hyperparameters()
         
-        self.action_dim = action_dim
+        self.action_dim = action_dim  # May be updated later if None
         self.lambda_param = lambda_param
         self.action_lower = action_limits[0]
         self.action_upper = action_limits[1]
@@ -54,14 +54,17 @@ class CLFQPSolverLightning(pl.LightningModule):
         self.max_retries = max_retries
         self.verbose = verbose
         
-        # Setup the optimization problem
-        self._setup_qp_problem()
+        # QP problem will be set up later when action_dim is known
+        self.qp_layer = None
         
         # Initialize storage for results
         self.reset_values()
         
     def _setup_qp_problem(self) -> None:
         """Set up the QP problem with cvxpy variables and constraints"""
+        if self.action_dim is None:
+            raise ValueError("action_dim must be set before setting up the QP problem")
+            
         # Define QP variables and parameters
         u = cp.Variable(self.action_dim) 
         r = cp.Variable(1)
@@ -136,6 +139,24 @@ class CLFQPSolverLightning(pl.LightningModule):
         V_detached = V.detach()
         L_f_V_detached = L_f_V.detach()
         L_g_V_detached = L_g_V.detach()
+        
+        # Determine action_dim if not already set
+        if self.action_dim is None:
+            # Try to infer from L_g_V shape
+            if L_g_V_detached.dim() > 2:  # [batch, state_dim, action_dim]
+                self.action_dim = L_g_V_detached.shape[2]
+            else:  # [batch, action_dim]
+                self.action_dim = L_g_V_detached.shape[1]
+            
+            # If we've determined action_dim, set up the QP problem
+            if self.action_dim is not None:
+                self._setup_qp_problem()
+                if self.verbose:
+                    print(f"Automatically determined action_dim = {self.action_dim}")
+        
+        # Check if QP layer is set up
+        if self.qp_layer is None:
+            raise ValueError("QP solver not initialized. action_dim could not be determined.")
         
         # Attempt to solve with retries
         for attempt in range(self.max_retries):

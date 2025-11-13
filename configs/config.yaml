@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+  - model: dynamics_ensemble
+  - optimizer: adam
+  - experiment: default
+  - logger: wandb
+  - override hydra/job_logging: default
+  - override hydra/hydra_logging: default
+
+# Hydra configuration
+hydra:
+  run:
+    dir: outputs/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+# Seed for reproducibility
+seed: 42
+
+# Device configuration
+device:
+  accelerator: auto  # auto, cpu, gpu, tpu, etc.
+  devices: auto      # number of devices to use
+  precision: 32      # 16, 32, 64, etc. for floating-point precision
+
+# Training configuration
+training:
+  max_epochs: 100
+  batch_size: 64
+  val_check_interval: 1.0  # validate every epoch
+  gradient_clip_val: 1.0
+  checkpoint_every_n_epochs: 5
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+    monitor: val_loss
+    mode: min
+
+# Checkpoint settings
+checkpoint:
+  dirpath: ${hydra:runtime.output_dir}/checkpoints
+  filename: epoch_{epoch:03d}
+  save_top_k: 3
+  monitor: val_loss
+  mode: min
+  auto_insert_metric_name: true
+  every_n_epochs: 5
+  save_last: true

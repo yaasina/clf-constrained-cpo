@@ -29,7 +29,8 @@ class CLFNetworkLightning(pl.LightningModule):
         dropout_rate: float = 0.1,
         learning_rate: float = 1e-3,
         nonlinearity: nn.Module = nn.Tanh(),
-        output_nonlinearity: Optional[nn.Module] = None
+        output_nonlinearity: Optional[nn.Module] = None,
+        loss: Optional[Dict[str, float]] = None
     ) -> None:
         """
         Initialize the CLF network.
@@ -41,6 +42,7 @@ class CLFNetworkLightning(pl.LightningModule):
             learning_rate: Learning rate for optimizer
             nonlinearity: Activation function for hidden layers
             output_nonlinearity: Activation function for output layer (None for linear output)
+            loss: Dictionary of loss hyperparameters (alpha1, alpha2, alpha3, alpha4)
         """
         super().__init__()
         
@@ -49,6 +51,13 @@ class CLFNetworkLightning(pl.LightningModule):
         self.state_dim = state_dim
         self.output_nonlinearity = output_nonlinearity
         self.learning_rate = learning_rate
+        
+        # Set loss hyperparameters with defaults
+        self.loss_params = loss or {}
+        self.alpha1 = self.loss_params.get('alpha1', 1.0)
+        self.alpha2 = self.loss_params.get('alpha2', 0.1)
+        self.alpha3 = self.loss_params.get('alpha3', 1.0)
+        self.alpha4 = self.loss_params.get('alpha4', 1.0)
         
         # Define neural network architecture with dropout
         self.layers = nn.Sequential(
@@ -382,6 +391,91 @@ class CLFNetworkLightning(pl.LightningModule):
         
         return lambda_lie * lie_loss
     
+    def compute_self_supervised_clf_loss(
+        self,
+        states: torch.Tensor,
+        dynamics_model: nn.Module,
+        qp_solver,
+        next_states: Optional[torch.Tensor] = None,
+        dt: float = 0.05,
+        alpha1: float = 1.0,  # Weight for equilibrium term
+        alpha2: float = 0.1,  # Weight for relaxation variable term
+        alpha3: float = 1.0,  # Weight for lie derivative term
+        alpha4: float = 1.0,  # Weight for CLF decrease over time term
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute the self-supervised CLF loss according to the formula:
+        L(θ) = α₁V_θ(0) + (α₂/B)∑ᵢr_i + (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0) + (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
+        
+        Args:
+            states: Batch of state vectors [batch_size, state_dim]
+            dynamics_model: Model of the system dynamics
+            qp_solver: QP solver for computing optimal controls and relaxation variables
+            next_states: Optional batch of next state vectors [batch_size, state_dim]
+            dt: Time step for computing temporal difference
+            alpha1-alpha4: Weights for the different loss terms
+            
+        Returns:
+            Dictionary containing individual loss terms and total loss
+        """
+        batch_size = states.shape[0]
+        device = states.device
+        
+        # Term 1: V_θ(0) - Minimize the CLF value at the equilibrium point
+        # For pendulum, the equilibrium is [cos(θ)=1, sin(θ)=0, θ̇=0] = [1, 0, 0]
+        from pendulum_utils import get_pendulum_equilibrium
+        equilibrium_state = get_pendulum_equilibrium().to(device)
+        equilibrium_value = self.compute_clf(equilibrium_state.unsqueeze(0))
+        loss_equilibrium = alpha1 * equilibrium_value
+        
+        # Compute Lie derivatives for the batch
+        L_f_V, L_g_V = self.lie_derivatives(states, dynamics_model)
+        
+        # Solve QP for each state in the batch to get optimal controls and relaxation variables
+        # We need to solve: min ||u||² + λr subject to L_f V + L_g V u + γV ≤ r, r ≥ 0
+        qp_results = qp_solver.solve_batch(states, self, dynamics_model, batch_size=batch_size)
+        
+        # Extract optimal controls and relaxation variables
+        u_values = qp_results['u_values']
+        r_values = qp_results['r_values']
+        
+        # Term 2: (α₂/B)∑ᵢr_i - Minimize the relaxation variables
+        loss_relaxation = alpha2 * torch.mean(r_values)
+        
+        # Term 3: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0) - Enforce negative Lie derivative
+        lie_derivatives = []
+        for i in range(batch_size):
+            state = states[i:i+1]
+            control = u_values[i:i+1]
+            L_dot = self.compute_lie_derivative_with_action(state, control, dynamics_model)
+            lie_derivatives.append(L_dot)
+        
+        lie_derivatives = torch.cat(lie_derivatives)
+        loss_lie_derivative = alpha3 * torch.mean(torch.relu(lie_derivatives))
+        
+        # Term 4: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0) - Ensure CLF decreases over time
+        loss_temporal = torch.tensor(0.0, device=device)
+        if next_states is not None:
+            current_values = self.compute_clf(states)
+            next_values = self.compute_clf(next_states)
+            
+            # Compute temporal difference rate (V(x+) - V(x))/dt
+            v_dot = (next_values - current_values) / dt
+            
+            # We want this to be negative, so penalize positive values
+            loss_temporal = alpha4 * torch.mean(torch.relu(v_dot))
+        
+        # Combine all terms
+        total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal
+        
+        return {
+            "loss": total_loss,
+            "loss_equilibrium": loss_equilibrium,
+            "loss_relaxation": loss_relaxation, 
+            "loss_lie_derivative": loss_lie_derivative,
+            "loss_temporal": loss_temporal
+        }
+    
     def training_step(
         self, 
         batch: Dict[str, torch.Tensor], 
@@ -391,7 +485,7 @@ class CLFNetworkLightning(pl.LightningModule):
         Training step for PyTorch Lightning.
         
         Args:
-            batch: Dictionary containing states and optionally dynamics_model
+            batch: Dictionary containing states, dynamics_model, and qp_solver
             batch_idx: Index of the current batch
             
         Returns:
@@ -399,25 +493,63 @@ class CLFNetworkLightning(pl.LightningModule):
         """
         states = batch["states"]
         
-        # Compute basic CLF loss (positive definiteness)
-        clf_loss = self.compute_clf_loss(states)
-        
-        total_loss = clf_loss
-        
-        # If dynamics model is provided, compute Lie derivative loss
-        if "dynamics_model" in batch:
+        # If dynamics model is provided, use self-supervised learning with the CLF loss
+        if "dynamics_model" in batch and "qp_solver" in batch:
             dynamics_model = batch["dynamics_model"]
-            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-            total_loss = clf_loss + lie_loss
+            qp_solver = batch["qp_solver"]
+            
+            # Get next states if they are available for temporal difference term
+            next_states = batch.get("next_states", None)
+            dt = batch.get("dt", 0.05)  # Default dt if not provided
+            
+            # Compute self-supervised CLF loss
+            loss_dict = self.compute_self_supervised_clf_loss(
+                states=states,
+                dynamics_model=dynamics_model,
+                qp_solver=qp_solver,
+                next_states=next_states,
+                dt=dt,
+                alpha1=self.alpha1,  # Weight for equilibrium term
+                alpha2=self.alpha2,  # Weight for relaxation variable term
+                alpha3=self.alpha3,  # Weight for lie derivative term
+                alpha4=self.alpha4 if next_states is not None else 0.0  # Weight for CLF decrease over time term
+            )
+            
+            # Get the total loss and individual loss terms
+            total_loss = loss_dict["loss"]
+            
+            # Log all loss components
+            self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log("train_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=True, on_epoch=True, logger=True)
+            self.log("train_loss_relaxation", loss_dict["loss_relaxation"], on_step=True, on_epoch=True, logger=True)
+            self.log("train_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=True, on_epoch=True, logger=True)
+            
+            if next_states is not None:
+                self.log("train_loss_temporal", loss_dict["loss_temporal"], on_step=True, on_epoch=True, logger=True)
+            
+            return {"loss": total_loss}
+        
+        # Fallback to basic CLF loss when necessary components aren't available
+        else:
+            # Compute basic CLF loss (positive definiteness)
+            clf_loss = self.compute_clf_loss(states)
+            
+            total_loss = clf_loss
+            
+            # If only dynamics model is provided, compute Lie derivative loss
+            if "dynamics_model" in batch:
+                dynamics_model = batch["dynamics_model"]
+                lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
+                total_loss = clf_loss + lie_loss
+                
+                # Log metrics
+                self.log("train_lie_loss", lie_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
             
             # Log metrics
-            self.log("train_lie_loss", lie_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Log metrics
-        self.log("train_clf_loss", clf_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        return {"loss": total_loss}
+            self.log("train_clf_loss", clf_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            
+            return {"loss": total_loss}
     
     def validation_step(
         self, 
@@ -428,7 +560,7 @@ class CLFNetworkLightning(pl.LightningModule):
         Validation step for PyTorch Lightning.
         
         Args:
-            batch: Dictionary containing states and optionally dynamics_model
+            batch: Dictionary containing states, dynamics_model, and qp_solver
             batch_idx: Index of the current batch
             
         Returns:
@@ -436,23 +568,59 @@ class CLFNetworkLightning(pl.LightningModule):
         """
         states = batch["states"]
         
-        # Compute basic CLF loss (positive definiteness)
-        clf_loss = self.compute_clf_loss(states)
-        
-        total_loss = clf_loss
-        
-        # If dynamics model is provided, compute Lie derivative loss
-        if "dynamics_model" in batch:
+        # If dynamics model and QP solver are provided, use self-supervised learning with the CLF loss
+        if "dynamics_model" in batch and "qp_solver" in batch:
             dynamics_model = batch["dynamics_model"]
-            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-            total_loss = clf_loss + lie_loss
+            qp_solver = batch["qp_solver"]
+            
+            # Get next states if they are available for temporal difference term
+            next_states = batch.get("next_states", None)
+            dt = batch.get("dt", 0.05)  # Default dt if not provided
+            
+            # Compute self-supervised CLF loss
+            loss_dict = self.compute_self_supervised_clf_loss(
+                states=states,
+                dynamics_model=dynamics_model,
+                qp_solver=qp_solver,
+                next_states=next_states,
+                dt=dt,
+                alpha1=self.alpha1,  # Weight for equilibrium term
+                alpha2=self.alpha2,  # Weight for relaxation variable term
+                alpha3=self.alpha3,  # Weight for lie derivative term
+                alpha4=self.alpha4 if next_states is not None else 0.0  # Weight for CLF decrease over time term
+            )
+            
+            # Get the total loss and individual loss terms
+            total_loss = loss_dict["loss"]
+            
+            # Log all loss components
+            self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log("val_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=False, on_epoch=True, logger=True)
+            self.log("val_loss_relaxation", loss_dict["loss_relaxation"], on_step=False, on_epoch=True, logger=True)
+            self.log("val_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=False, on_epoch=True, logger=True)
+            
+            if next_states is not None:
+                self.log("val_loss_temporal", loss_dict["loss_temporal"], on_step=False, on_epoch=True, logger=True)
+        
+        # Fallback to basic CLF loss when necessary components aren't available
+        else:
+            # Compute basic CLF loss (positive definiteness)
+            clf_loss = self.compute_clf_loss(states)
+            
+            total_loss = clf_loss
+            
+            # If only dynamics model is provided, compute Lie derivative loss
+            if "dynamics_model" in batch:
+                dynamics_model = batch["dynamics_model"]
+                lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
+                total_loss = clf_loss + lie_loss
+                
+                # Log metrics
+                self.log("val_lie_loss", lie_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
             
             # Log metrics
-            self.log("val_lie_loss", lie_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Log metrics
-        self.log("val_clf_loss", clf_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log("val_clf_loss", clf_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         
         # If it's the first validation batch of an epoch, visualize CLF
         if batch_idx == 0 and self.logger is not None and isinstance(self.logger, pl.loggers.WandbLogger):
@@ -474,7 +642,7 @@ class CLFNetworkLightning(pl.LightningModule):
         Test step for PyTorch Lightning.
         
         Args:
-            batch: Dictionary containing states and optionally dynamics_model
+            batch: Dictionary containing states, dynamics_model, and qp_solver
             batch_idx: Index of the current batch
             
         Returns:
@@ -482,25 +650,63 @@ class CLFNetworkLightning(pl.LightningModule):
         """
         states = batch["states"]
         
-        # Compute basic CLF loss (positive definiteness)
-        clf_loss = self.compute_clf_loss(states)
-        
-        total_loss = clf_loss
-        
-        # If dynamics model is provided, compute Lie derivative loss
-        if "dynamics_model" in batch:
+        # If dynamics model and QP solver are provided, use self-supervised learning with the CLF loss
+        if "dynamics_model" in batch and "qp_solver" in batch:
             dynamics_model = batch["dynamics_model"]
-            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-            total_loss = clf_loss + lie_loss
+            qp_solver = batch["qp_solver"]
+            
+            # Get next states if they are available for temporal difference term
+            next_states = batch.get("next_states", None)
+            dt = batch.get("dt", 0.05)  # Default dt if not provided
+            
+            # Compute self-supervised CLF loss
+            loss_dict = self.compute_self_supervised_clf_loss(
+                states=states,
+                dynamics_model=dynamics_model,
+                qp_solver=qp_solver,
+                next_states=next_states,
+                dt=dt,
+                alpha1=self.alpha1,  # Weight for equilibrium term
+                alpha2=self.alpha2,  # Weight for relaxation variable term
+                alpha3=self.alpha3,  # Weight for lie derivative term
+                alpha4=self.alpha4 if next_states is not None else 0.0  # Weight for CLF decrease over time term
+            )
+            
+            # Get the total loss and individual loss terms
+            total_loss = loss_dict["loss"]
+            
+            # Log all loss components
+            self.log("test_loss", total_loss, on_step=False, on_epoch=True, logger=True)
+            self.log("test_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=False, on_epoch=True, logger=True)
+            self.log("test_loss_relaxation", loss_dict["loss_relaxation"], on_step=False, on_epoch=True, logger=True)
+            self.log("test_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=False, on_epoch=True, logger=True)
+            
+            if next_states is not None:
+                self.log("test_loss_temporal", loss_dict["loss_temporal"], on_step=False, on_epoch=True, logger=True)
+            
+            return {"test_loss": total_loss}
+        
+        # Fallback to basic CLF loss when necessary components aren't available
+        else:
+            # Compute basic CLF loss (positive definiteness)
+            clf_loss = self.compute_clf_loss(states)
+            
+            total_loss = clf_loss
+            
+            # If only dynamics model is provided, compute Lie derivative loss
+            if "dynamics_model" in batch:
+                dynamics_model = batch["dynamics_model"]
+                lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
+                total_loss = clf_loss + lie_loss
+                
+                # Log metrics
+                self.log("test_lie_loss", lie_loss, on_step=False, on_epoch=True, logger=True)
             
             # Log metrics
-            self.log("test_lie_loss", lie_loss, on_step=False, on_epoch=True, logger=True)
-        
-        # Log metrics
-        self.log("test_clf_loss", clf_loss, on_step=False, on_epoch=True, logger=True)
-        self.log("test_loss", total_loss, on_step=False, on_epoch=True, logger=True)
-        
-        return {"test_loss": total_loss}
+            self.log("test_clf_loss", clf_loss, on_step=False, on_epoch=True, logger=True)
+            self.log("test_loss", total_loss, on_step=False, on_epoch=True, logger=True)
+            
+            return {"test_loss": total_loss}
     
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """
@@ -814,3 +1020,221 @@ class CLFNetworkLightning(pl.LightningModule):
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
                 wandb.log({"lie_derivative_total": fig})
+    
+    def on_train_start(self) -> None:
+        """
+        Called when the training begins. Initialize tracking of CLF equilibrium value
+        for monitoring during training.
+        """
+        super().on_train_start()
+        # Initialize tracking of equilibrium value
+        self.equilibrium_values = []
+        self.global_steps = []
+        
+        # Store the grid for visualizations - we only need to create it once
+        if hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'config'):
+            # Try to get environment name from wandb config
+            env_name = self.logger.experiment.config.get('env_name', 'Pendulum-v1')
+        else:
+            # Default to Pendulum if not found
+            env_name = 'Pendulum-v1'
+            
+        # Create the grid - cache for later use
+        # Only call this once at the start of training for efficiency
+        device = next(self.parameters()).device
+        self.grid_states, self.grid_info = None, None
+        
+        try:
+            from src.utils.clf_visualizations import create_state_grid_from_env
+            self.grid_states, self.grid_info = create_state_grid_from_env(
+                env_name=env_name,
+                resolution=50,  # 50x50 grid for nice visualizations
+                device=device
+            )
+            print(f"Created visualization grid for {env_name} with shape {self.grid_states.shape}")
+        except Exception as e:
+            print(f"Failed to create visualization grid: {e}")
+            # Continue without the grid-based visualizations
+    
+    def on_train_batch_end(
+        self, 
+        outputs: Dict[str, torch.Tensor], 
+        batch: Dict[str, torch.Tensor], 
+        batch_idx: int, 
+        dataloader_idx: int = 0
+    ) -> None:
+        """
+        Called at the end of each training batch. Track CLF value at equilibrium.
+        
+        Args:
+            outputs: Outputs from the training step
+            batch: Current batch of data
+            batch_idx: Index of the current batch
+            dataloader_idx: Index of the current dataloader
+        """
+        super().on_train_batch_end(outputs, batch, batch_idx, dataloader_idx)
+        
+        # Log equilibrium value at regular intervals
+        # Compute on device to avoid unnecessary transfers
+        device = next(self.parameters()).device
+        
+        # Use the pendulum-specific equilibrium from pendulum_utils
+        from pendulum_utils import get_pendulum_equilibrium
+        equilibrium_state = get_pendulum_equilibrium().to(device)
+        
+        # Compute CLF value at equilibrium
+        with torch.no_grad():
+            equilibrium_value = self.compute_clf(equilibrium_state.unsqueeze(0)).item()
+        
+        # Store values for plotting trends
+        self.equilibrium_values.append(equilibrium_value)
+        # Current global step is available from the trainer
+        if hasattr(self, 'global_step'):
+            self.global_steps.append(self.global_step)
+        else:
+            self.global_steps.append(len(self.equilibrium_values))
+        
+        # Log the equilibrium value
+        self.log("clf_equilibrium_value", equilibrium_value, on_step=True, on_epoch=True, logger=True)
+        
+        # Every 100 steps, log a plot of the equilibrium value history
+        if len(self.equilibrium_values) % 100 == 0 and isinstance(self.logger, pl.loggers.WandbLogger):
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=self.global_steps,
+                    y=self.equilibrium_values,
+                    mode="lines",
+                    name="CLF at Equilibrium"
+                )
+            )
+            
+            fig.update_layout(
+                title="CLF Value at Equilibrium During Training",
+                xaxis_title="Training Step",
+                yaxis_title="CLF Value",
+                showlegend=True
+            )
+            
+            # Log to wandb
+            wandb.log({"clf_equilibrium_history": fig})
+    
+    def on_train_epoch_end(self) -> None:
+        """
+        Called at the end of each training epoch. Generate and log more detailed 
+        visualizations using the grid.
+        """
+        super().on_train_epoch_end()
+        
+        # Only proceed if we have a grid and the necessary models
+        if not hasattr(self, 'grid_states') or self.grid_states is None:
+            return
+        
+        # Log the CLF value over the grid
+        try:
+            from src.utils.clf_visualizations import visualize_clf_value_grid
+            
+            # Generate contour plot of CLF values over the state space
+            fig = visualize_clf_value_grid(self, self.grid_states, self.grid_info)
+            
+            # Log to wandb
+            if isinstance(self.logger, pl.loggers.WandbLogger):
+                wandb.log({"clf_value_contour": fig})
+        except Exception as e:
+            print(f"Failed to generate CLF value contour: {e}")
+        
+        # After some epochs, generate more complex visualizations that require dynamics model
+        # Only do this occasionally as it's computationally expensive
+        if self.current_epoch % 5 == 0:  # Every 5 epochs
+            self._log_admissible_control_visualizations()
+    
+    def _log_admissible_control_visualizations(self) -> None:
+        """
+        Generate and log visualizations of the admissible control set and Lie derivatives 
+        with the infimum control.
+        """
+        # Check if we have necessary components
+        if not hasattr(self, 'grid_states') or self.grid_states is None:
+            return
+        
+        # Try to get dynamics model and action limits from the trainer
+        dynamics_model = None
+        action_bounds = (-5.0, 5.0)  # Default for pendulum
+        action_dim = 1  # Default for pendulum
+        
+        # Get dynamics model from trainer's datamodule or callbacks
+        if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'dynamics_model'):
+            dynamics_model = self.trainer.datamodule.dynamics_model
+        elif hasattr(self.trainer, 'callbacks'):
+            for callback in self.trainer.callbacks:
+                if hasattr(callback, 'dynamics_model'):
+                    dynamics_model = callback.dynamics_model
+                    break
+        
+        # Get action bounds from trainer or config
+        try:
+            if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'env'):
+                # Get from environment
+                env = self.trainer.datamodule.env
+                action_bounds = (float(env.action_space.low[0]), float(env.action_space.high[0]))
+                action_dim = env.action_space.shape[0]
+            elif hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'config'):
+                # Try to get from wandb config
+                cfg = self.logger.experiment.config
+                if 'clf' in cfg and 'qp_solver' in cfg['clf'] and 'action_limits' in cfg['clf']['qp_solver']:
+                    action_bounds = tuple(cfg['clf']['qp_solver']['action_limits'])
+                if 'action_dim' in cfg:
+                    action_dim = cfg['action_dim']
+        except Exception as e:
+            print(f"Failed to get action bounds: {e}")
+        
+        # Check if we have all necessary components
+        if dynamics_model is None:
+            print("No dynamics model available for admissible control visualization")
+            return
+        
+        # Generate admissible control set visualization
+        try:
+            from src.utils.clf_visualizations import visualize_admissible_control_set
+            
+            # Generate contour plots
+            fig, infimum_actions, lie_derivatives = visualize_admissible_control_set(
+                clf_model=self,
+                dynamics_model=dynamics_model,
+                grid_states=self.grid_states,
+                grid_info=self.grid_info,
+                action_bounds=action_bounds,
+                action_dim=action_dim,
+                resolution=100  # Resolution for action sampling
+            )
+            
+            # Log to wandb
+            if isinstance(self.logger, pl.loggers.WandbLogger):
+                wandb.log({"admissible_control_set": fig})
+                
+                # Also log statistics about the admissible control set
+                n_admissible = torch.sum(infimum_actions != float('inf')).item()
+                total_points = len(infimum_actions)
+                coverage = 100.0 * n_admissible / total_points
+                
+                # Log the percentage of states that have an admissible control
+                wandb.log({
+                    "admissible_control_coverage": coverage,
+                    "admissible_control_count": n_admissible,
+                })
+                
+                # Log histogram of infimum action values (excluding points with no admissible control)
+                valid_actions = infimum_actions[infimum_actions != float('inf')].cpu().numpy()
+                if len(valid_actions) > 0:
+                    fig = go.Figure(data=go.Histogram(x=valid_actions, nbinsx=30))
+                    fig.update_layout(
+                        title="Distribution of Infimum Admissible Controls",
+                        xaxis_title="Control Value",
+                        yaxis_title="Count"
+                    )
+                    wandb.log({"admissible_control_histogram": fig})
+                
+        except Exception as e:
+            print(f"Failed to generate admissible control visualization: {e}")
+            import traceback
+            traceback.print_exc()
