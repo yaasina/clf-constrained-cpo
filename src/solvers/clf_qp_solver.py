@@ -9,7 +9,6 @@ from typing import Tuple, List, Dict, Any, Optional, Union, Callable
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 import pytorch_lightning as pl
-import wandb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -177,15 +176,19 @@ class CLFQPSolverLightning(pl.LightningModule):
         return torch.zeros(self.action_dim, device=x.device), torch.tensor([float('inf')], device=x.device), True
 
     def solve_batch(
-        self, 
-        dataset: torch.Tensor, 
+        self,
+        dataset: torch.Tensor,
         clf_net: nn.Module,
-        dynamics_model: nn.Module, 
+        dynamics_model: nn.Module,
         batch_size: int = 32,
         log_results: bool = False
     ) -> Dict[str, Any]:
         """
-        Solve the QP problem for a batch of states, processing in smaller batches for efficiency.
+        Solve the QP problem for a collection of states.
+
+        CLF/Lie derivative quantities are computed in mini-batches of `batch_size` for
+        memory efficiency; the QP itself is still solved per-point (CvxpyLayer does
+        support batched solves — batched QP is a future improvement) (R4).
         
         Args:
             dataset: Dataset of state points with shape (n_samples, state_dim)
@@ -424,7 +427,10 @@ class CLFQPSolverLightning(pl.LightningModule):
     ) -> None:
         """
         Log QP solver results to Weights & Biases.
-        
+
+        Note: no torch.no_grad() wrapper here — gradient() is called internally
+        and requires an active autograd graph (C1).
+
         Args:
             states: Batch of states [batch_size, state_dim]
             u_values: Batch of control inputs [batch_size, action_dim]
@@ -433,139 +439,111 @@ class CLFQPSolverLightning(pl.LightningModule):
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
         """
-        with torch.no_grad():
-            # Create scatter plot of control values vs. state norm
-            if self.action_dim == 1:
-                # 1D control, can visualize directly
-                state_norms = torch.norm(states, dim=1).cpu().numpy()
-                
-                # Create figure
-                fig = go.Figure()
-                
-                # Plot control values for successful points
-                successful_mask = np.ones(len(states), dtype=bool)
-                successful_mask[failed_indices] = False
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=state_norms[successful_mask],
-                        y=u_values.squeeze().cpu().numpy(),
-                        mode="markers",
-                        marker=dict(
-                            size=8,
-                            color=r_values.squeeze().cpu().numpy(),
-                            colorscale="Viridis",
-                            showscale=True,
-                            colorbar=dict(title="Relaxation Value r")
-                        ),
-                        name="Successful QP Solutions"
-                    )
-                )
-                
-                # Plot failed points
-                if failed_indices:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=state_norms[failed_indices],
-                            y=np.zeros(len(failed_indices)),
-                            mode="markers",
-                            marker=dict(
-                                size=8,
-                                color="red",
-                                symbol="x"
-                            ),
-                            name="Failed QP Solutions"
-                        )
-                    )
-                
-                fig.update_layout(
-                    title="QP Control Solutions vs. State Norm",
-                    xaxis_title="State Norm ||x||",
-                    yaxis_title="Control Value u",
-                    showlegend=True
-                )
-                
-                # Log to wandb
-                if isinstance(self.logger, pl.loggers.WandbLogger):
-                    wandb.log({"qp_control_vs_norm": fig})
-                    
-                # Create histogram of relaxation values
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Histogram(
-                        x=r_values.squeeze().cpu().numpy(),
-                        nbinsx=30,
-                        marker_color="blue"
-                    )
-                )
-                
-                fig.update_layout(
-                    title="Distribution of Relaxation Values",
-                    xaxis_title="Relaxation Value r",
-                    yaxis_title="Count"
-                )
-                
-                # Log to wandb
-                if isinstance(self.logger, pl.loggers.WandbLogger):
-                    wandb.log({"qp_relaxation_histogram": fig})
-            
-            # Create visualization of resulting Lie derivatives with the computed control
-            # Sample a subset of states for visualization
-            max_samples = min(100, len(states))
-            sample_indices = np.random.choice(len(states), max_samples, replace=False)
-            
-            sampled_states = states[sample_indices]
-            sampled_controls = u_values[sample_indices]
-            
-            # Compute Lie derivatives with the computed control
-            lie_derivatives = []
-            clf_values = []
-            
-            for i in range(len(sampled_states)):
-                state = sampled_states[i:i+1]
-                control = sampled_controls[i:i+1]
-                
-                # Compute CLF value
-                clf_value = clf_net.compute_clf(state)
-                clf_values.append(clf_value.item())
-                
-                # Compute Lie derivative with the computed control
-                lie_derivative = clf_net.compute_lie_derivative_with_action(state, control, dynamics_model)
-                lie_derivatives.append(lie_derivative.item())
-            
-            # Create scatter plot of Lie derivatives with computed control
-            state_norms = torch.norm(sampled_states, dim=1).cpu().numpy()
-            
+        if not (isinstance(self.logger, pl.loggers.WandbLogger)):
+            return
+
+        # 1D action: scatter of u vs state norm, histogram of r
+        if self.action_dim == 1:
+            state_norms = torch.norm(states, dim=1).cpu().numpy()
+
+            successful_mask = np.ones(len(states), dtype=bool)
+            successful_mask[failed_indices] = False
+
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
-                    x=state_norms,
-                    y=lie_derivatives,
+                    x=state_norms[successful_mask],
+                    y=u_values.squeeze().cpu().numpy(),
                     mode="markers",
                     marker=dict(
                         size=8,
-                        color=clf_values,
+                        color=r_values.squeeze().cpu().numpy(),
                         colorscale="Viridis",
                         showscale=True,
-                        colorbar=dict(title="CLF Value")
+                        colorbar=dict(title="Relaxation Value r")
                     ),
-                    name="Lie Derivative with QP Control"
+                    name="Successful QP Solutions"
                 )
             )
-            
-            # Add zero reference line
-            fig.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
-            
+            if failed_indices:
+                fig.add_trace(
+                    go.Scatter(
+                        x=state_norms[failed_indices],
+                        y=np.zeros(len(failed_indices)),
+                        mode="markers",
+                        marker=dict(size=8, color="red", symbol="x"),
+                        name="Failed QP Solutions"
+                    )
+                )
             fig.update_layout(
-                title="Lie Derivative with QP Control vs. State Norm",
+                title="QP Control Solutions vs. State Norm",
                 xaxis_title="State Norm ||x||",
-                yaxis_title="Lie Derivative",
+                yaxis_title="Control Value u",
                 showlegend=True
             )
-            
-            # Log to wandb
-            if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"lie_derivative_with_qp_control": fig})
+            self.logger.experiment.log(
+                {"qp_control_vs_norm": fig}, step=self.global_step
+            )
+
+            fig2 = go.Figure()
+            fig2.add_trace(
+                go.Histogram(
+                    x=r_values.squeeze().cpu().numpy(),
+                    nbinsx=30, marker_color="blue"
+                )
+            )
+            fig2.update_layout(
+                title="Distribution of Relaxation Values",
+                xaxis_title="Relaxation Value r",
+                yaxis_title="Count"
+            )
+            self.logger.experiment.log(
+                {"qp_relaxation_histogram": fig2}, step=self.global_step
+            )
+
+        # Lie derivative scatter for a sample of states
+        max_samples = min(100, len(states))
+        sample_indices = np.random.choice(len(states), max_samples, replace=False)
+        sampled_states = states[sample_indices]
+        sampled_controls = u_values[sample_indices]
+
+        lie_derivative_vals = []
+        clf_value_vals = []
+        for i in range(len(sampled_states)):
+            state = sampled_states[i:i+1]
+            control = sampled_controls[i:i+1]
+            clf_value_vals.append(clf_net.compute_clf(state).item())
+            lie_derivative_vals.append(
+                clf_net.compute_lie_derivative_with_action(state, control, dynamics_model).item()
+            )
+
+        state_norms = torch.norm(sampled_states, dim=1).cpu().numpy()
+        fig3 = go.Figure()
+        fig3.add_trace(
+            go.Scatter(
+                x=state_norms,
+                y=lie_derivative_vals,
+                mode="markers",
+                marker=dict(
+                    size=8,
+                    color=clf_value_vals,
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title="CLF Value")
+                ),
+                name="Lie Derivative with QP Control"
+            )
+        )
+        fig3.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
+        fig3.update_layout(
+            title="Lie Derivative with QP Control vs. State Norm",
+            xaxis_title="State Norm ||x||",
+            yaxis_title="Lie Derivative",
+            showlegend=True
+        )
+        self.logger.experiment.log(
+            {"lie_derivative_with_qp_control": fig3}, step=self.global_step
+        )
     
     def _log_admissible_controls_1d_wandb(
         self,
@@ -587,83 +565,61 @@ class CLFQPSolverLightning(pl.LightningModule):
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
         """
-        with torch.no_grad():
-            # Create figure
-            fig = go.Figure()
-            
-            # Plot Lie derivative for each control sample
+        # No torch.no_grad() — solve_point calls gradient() which needs autograd (C1)
+        if not isinstance(self.logger, pl.loggers.WandbLogger):
+            return
+
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Scatter(
+                x=control_samples.squeeze().cpu().numpy(),
+                y=lie_derivatives.squeeze().cpu().numpy(),
+                mode="lines",
+                line=dict(color="blue", width=2),
+                name="Lie Derivative"
+            )
+        )
+
+        if len(admissible_controls) > 0:
+            admissible_indices = [
+                torch.argmin(torch.abs(control_samples - u)).item()
+                for u in admissible_controls
+            ]
+            admissible_x = admissible_controls.squeeze().cpu().numpy()
+            admissible_y = lie_derivatives.squeeze()[admissible_indices].cpu().numpy()
             fig.add_trace(
                 go.Scatter(
-                    x=control_samples.squeeze().cpu().numpy(),
-                    y=lie_derivatives.squeeze().cpu().numpy(),
-                    mode="lines",
-                    line=dict(color="blue", width=2),
-                    name="Lie Derivative"
+                    x=admissible_x,
+                    y=admissible_y,
+                    mode="markers",
+                    marker=dict(size=8, color="green", symbol="circle"),
+                    name="Admissible Controls"
                 )
             )
-            
-            # Highlight admissible controls
-            if len(admissible_controls) > 0:
-                # Create admissible region by adding a colored area
-                # First, determine the y-values corresponding to the admissible controls
-                admissible_indices = []
-                for u in admissible_controls:
-                    idx = torch.argmin(torch.abs(control_samples - u)).item()
-                    admissible_indices.append(idx)
-                
-                admissible_x = admissible_controls.squeeze().cpu().numpy()
-                admissible_y = lie_derivatives.squeeze()[admissible_indices].cpu().numpy()
-                
-                # Add a colored area for admissible region
-                fig.add_trace(
-                    go.Scatter(
-                        x=admissible_x,
-                        y=admissible_y,
-                        mode="markers",
-                        marker=dict(
-                            size=8,
-                            color="green",
-                            symbol="circle"
-                        ),
-                        name="Admissible Controls"
-                    )
+
+            u_qp, _, _ = self.solve_point(state, clf_net, dynamics_model)
+            u_qp_idx = torch.argmin(torch.abs(control_samples - u_qp)).item()
+            fig.add_trace(
+                go.Scatter(
+                    x=[u_qp.item()],
+                    y=[lie_derivatives.squeeze()[u_qp_idx].item()],
+                    mode="markers",
+                    marker=dict(size=12, color="red", symbol="star"),
+                    name="QP Solution"
                 )
-                
-                # Compute the optimal control from QP
-                u_qp, _, _ = self.solve_point(state, clf_net, dynamics_model)
-                
-                # Find the closest control sample to the QP solution
-                u_qp_idx = torch.argmin(torch.abs(control_samples - u_qp)).item()
-                
-                # Add QP solution to the plot
-                fig.add_trace(
-                    go.Scatter(
-                        x=[u_qp.item()],
-                        y=[lie_derivatives.squeeze()[u_qp_idx].item()],
-                        mode="markers",
-                        marker=dict(
-                            size=12,
-                            color="red",
-                            symbol="star"
-                        ),
-                        name="QP Solution"
-                    )
-                )
-            
-            # Add zero reference line
-            fig.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
-            
-            # Update layout
-            fig.update_layout(
-                title=f"Lie Derivative vs. Control (State Norm: {torch.norm(state).item():.4f})",
-                xaxis_title="Control u",
-                yaxis_title="Lie Derivative",
-                showlegend=True
             )
-            
-            # Log to wandb
-            if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"admissible_controls_1d": fig})
+
+        fig.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
+        fig.update_layout(
+            title=f"Lie Derivative vs. Control (State Norm: {torch.norm(state).item():.4f})",
+            xaxis_title="Control u",
+            yaxis_title="Lie Derivative",
+            showlegend=True
+        )
+        self.logger.experiment.log(
+            {"admissible_controls_1d": fig}, step=self.global_step
+        )
     
     def _log_admissible_controls_2d_wandb(
         self,
@@ -691,127 +647,94 @@ class CLFQPSolverLightning(pl.LightningModule):
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
         """
-        with torch.no_grad():
-            # Create contour plot of Lie derivative values
-            grid_size = u1_samples.shape[0]
-            lie_grid = lie_derivatives.reshape(grid_size, grid_size).cpu().numpy()
-            
-            # Create figure with subplots
-            fig = make_subplots(
-                rows=1, 
-                cols=2,
-                subplot_titles=[
-                    "Lie Derivative Contour",
-                    "Admissible Control Region"
-                ],
-                specs=[[{"type": "contour"}, {"type": "scatter"}]]
-            )
-            
-            # Add contour plot
+        # No torch.no_grad() — solve_point calls gradient() which needs autograd (C1)
+        if not isinstance(self.logger, pl.loggers.WandbLogger):
+            return
+
+        grid_size = u1_samples.shape[0]
+        lie_grid = lie_derivatives.reshape(grid_size, grid_size).cpu().numpy()
+
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=["Lie Derivative Contour", "Admissible Control Region"],
+            specs=[[{"type": "contour"}, {"type": "scatter"}]]
+        )
+
+        fig.add_trace(
+            go.Contour(
+                z=lie_grid,
+                x=u1_samples.cpu().numpy(),
+                y=u2_samples.cpu().numpy(),
+                colorscale="Viridis",
+                contours=dict(start=-2, end=2, size=0.1, showlabels=True),
+                colorbar=dict(title="Lie Derivative", x=0.46),
+                name="Lie Derivative"
+            ),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Contour(
+                z=lie_grid,
+                x=u1_samples.cpu().numpy(),
+                y=u2_samples.cpu().numpy(),
+                contours=dict(start=0, end=0, size=0, showlabels=False, coloring="lines"),
+                line=dict(color="red", width=2),
+                showscale=False,
+                name="Zero Lie Derivative"
+            ),
+            row=1, col=1
+        )
+
+        if len(admissible_controls) > 0:
             fig.add_trace(
-                go.Contour(
-                    z=lie_grid,
-                    x=u1_samples.cpu().numpy(),
-                    y=u2_samples.cpu().numpy(),
-                    colorscale="Viridis",
-                    contours=dict(
-                        start=-2,
-                        end=2,
-                        size=0.1,
-                        showlabels=True
-                    ),
-                    colorbar=dict(
-                        title="Lie Derivative",
-                        x=0.46
-                    ),
-                    name="Lie Derivative"
+                go.Scatter(
+                    x=admissible_controls[:, 0].cpu().numpy(),
+                    y=admissible_controls[:, 1].cpu().numpy(),
+                    mode="markers",
+                    marker=dict(size=5, color="green", opacity=0.5),
+                    name="Admissible Controls"
                 ),
-                row=1, col=1
+                row=1, col=2
             )
-            
-            # Add zero contour line for better visibility
+            u_qp, _, _ = self.solve_point(state, clf_net, dynamics_model)
             fig.add_trace(
-                go.Contour(
-                    z=lie_grid,
-                    x=u1_samples.cpu().numpy(),
-                    y=u2_samples.cpu().numpy(),
-                    contours=dict(
-                        start=0,
-                        end=0,
-                        size=0,
-                        showlabels=False,
-                        coloring="lines"
-                    ),
-                    line=dict(color="red", width=2),
-                    showscale=False,
-                    name="Zero Lie Derivative"
+                go.Scatter(
+                    x=[u_qp[0].item()],
+                    y=[u_qp[1].item()],
+                    mode="markers",
+                    marker=dict(size=12, color="red", symbol="star"),
+                    name="QP Solution"
                 ),
-                row=1, col=1
+                row=1, col=2
             )
-            
-            # Plot admissible region (scatter plot)
-            if len(admissible_controls) > 0:
-                fig.add_trace(
-                    go.Scatter(
-                        x=admissible_controls[:, 0].cpu().numpy(),
-                        y=admissible_controls[:, 1].cpu().numpy(),
-                        mode="markers",
-                        marker=dict(
-                            size=5,
-                            color="green",
-                            opacity=0.5
-                        ),
-                        name="Admissible Controls"
-                    ),
-                    row=1, col=2
-                )
-                
-                # Compute the optimal control from QP
-                u_qp, _, _ = self.solve_point(state, clf_net, dynamics_model)
-                
-                # Add QP solution to the plot
-                fig.add_trace(
-                    go.Scatter(
-                        x=[u_qp[0].item()],
-                        y=[u_qp[1].item()],
-                        mode="markers",
-                        marker=dict(
-                            size=12,
-                            color="red",
-                            symbol="star"
-                        ),
-                        name="QP Solution"
-                    ),
-                    row=1, col=2
-                )
-                
-                # Add action limits to the plot
-                limit_x = np.array([self.action_lower, self.action_upper, self.action_upper, self.action_lower, self.action_lower])
-                limit_y = np.array([self.action_lower, self.action_lower, self.action_upper, self.action_upper, self.action_lower])
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=limit_x,
-                        y=limit_y,
-                        mode="lines",
-                        line=dict(color="black", dash="dash"),
-                        name="Action Limits"
-                    ),
-                    row=1, col=2
-                )
-            
-            # Update layout
-            fig.update_layout(
-                title=f"Admissible Control Region (State Norm: {torch.norm(state).item():.4f})",
-                height=500,
-                width=1000
+            limit_x = np.array([
+                self.action_lower, self.action_upper,
+                self.action_upper, self.action_lower, self.action_lower
+            ])
+            limit_y = np.array([
+                self.action_lower, self.action_lower,
+                self.action_upper, self.action_upper, self.action_lower
+            ])
+            fig.add_trace(
+                go.Scatter(
+                    x=limit_x, y=limit_y,
+                    mode="lines",
+                    line=dict(color="black", dash="dash"),
+                    name="Action Limits"
+                ),
+                row=1, col=2
             )
-            
-            fig.update_xaxes(title_text="Control u1", row=1, col=1)
-            fig.update_yaxes(title_text="Control u2", row=1, col=1)
-            fig.update_xaxes(title_text="Control u1", row=1, col=2)
-            fig.update_yaxes(title_text="Control u2", row=1, col=2)
-            
-            # Log to wandb
-            if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"admissible_controls_2d": fig})
+
+        fig.update_layout(
+            title=f"Admissible Control Region (State Norm: {torch.norm(state).item():.4f})",
+            height=500, width=1000
+        )
+        fig.update_xaxes(title_text="Control u1", row=1, col=1)
+        fig.update_yaxes(title_text="Control u2", row=1, col=1)
+        fig.update_xaxes(title_text="Control u1", row=1, col=2)
+        fig.update_yaxes(title_text="Control u2", row=1, col=2)
+
+        self.logger.experiment.log(
+            {"admissible_controls_2d": fig}, step=self.global_step
+        )

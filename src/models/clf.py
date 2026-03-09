@@ -7,8 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, List, Dict, Any, Optional, Union
 import pytorch_lightning as pl
-import numpy as np
-import wandb
 
 
 class CLFNetworkLightning(pl.LightningModule):
@@ -41,9 +39,10 @@ class CLFNetworkLightning(pl.LightningModule):
             output_nonlinearity: Activation function for output layer (None for linear output)
         """
         super().__init__()
-        
-        self.save_hyperparameters()
-        
+
+        # nn.Module args cannot be serialised by save_hyperparameters (C4)
+        self.save_hyperparameters(ignore=["nonlinearity", "output_nonlinearity"])
+
         self.state_dim = state_dim
         self.output_nonlinearity = output_nonlinearity
         self.learning_rate = learning_rate
@@ -74,8 +73,8 @@ class CLFNetworkLightning(pl.LightningModule):
         """
         # For equilibrium point (origin), ensure output is exactly zero
         if torch.all(torch.abs(state) < 1e-6):
-            # Create a zero tensor that maintains the computational graph connection
-            return torch.zeros(state.shape[0], 1, device=state.device, requires_grad=True) + state.sum() * 0.0 
+            # Tie the zero output to the computation graph through state (R1)
+            return torch.zeros(state.shape[0], 1, device=state.device) + state.sum() * 0.0
         
         # Normal forward pass through the network layers
         output = self.layers(state)
@@ -96,10 +95,6 @@ class CLFNetworkLightning(pl.LightningModule):
         Returns:
             CLF values [batch_size, 1]
         """
-        # Ensure we're using a tensor with requires_grad=True for gradient computation
-        if not state.requires_grad:
-            state = state.clone().requires_grad_(True)
-        
         # Get neural network output
         nn_output = self(state)
         
@@ -111,83 +106,56 @@ class CLFNetworkLightning(pl.LightningModule):
     def gradient(self, state: torch.Tensor) -> torch.Tensor:
         """
         Compute the gradient of the CLF with respect to the state.
-        
+
+        Uses a single vectorised autograd call: d(sum_i V(x_i))/d(x_j) = dV(x_j)/d(x_j)
+        because the network has no cross-sample interactions.
+
         Args:
             state: Batch of state vectors [batch_size, state_dim]
-            
+
         Returns:
-            Gradient of L(x) with respect to x [batch_size, state_dim]
+            Gradient of V(x) with respect to x [batch_size, state_dim]
         """
-        # Create a fresh tensor with requires_grad=True
+        # Fresh leaf so gradients flow through CLF parameters (G1, G2, G3)
         state_with_grad = state.detach().clone().requires_grad_(True)
-        
-        # Run a forward pass
-        clf_value = self.compute_clf(state_with_grad)
-        
-        # Create gradients tensor of same shape as state tensor
-        gradients = torch.zeros_like(state_with_grad)
-        
-        # Compute gradients for each sample separately to avoid graph issues
-        for i in range(state_with_grad.shape[0]):
-            single_state = state_with_grad[i:i+1]  # Keep batch dimension
-            
-            # Do another forward pass for this specific sample
-            single_clf_value = self.compute_clf(single_state)
-            
-            try:
-                # Compute gradient using autograd
-                grad_outputs = torch.ones_like(single_clf_value)
-                single_grad = torch.autograd.grad(
-                    outputs=single_clf_value,
-                    inputs=single_state,
-                    grad_outputs=grad_outputs,
-                    create_graph=True,
-                    retain_graph=True
-                )[0]
-                
-                gradients[i] = single_grad
-            except Exception:
-                # Use finite differences as fallback for this sample
-                gradients[i] = self._compute_gradient_fd(single_state.squeeze(0))
-        
+
+        clf_sum = self.compute_clf(state_with_grad).sum()  # scalar
+
+        try:
+            gradients = torch.autograd.grad(
+                outputs=clf_sum,
+                inputs=state_with_grad,
+                create_graph=True,
+            )[0]  # [batch_size, state_dim]
+        except Exception:
+            gradients = self._compute_gradient_fd(state)
+
         return gradients
     
     def _compute_gradient_fd(self, state: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
         """
         Compute gradient using finite differences as a fallback.
-        
+
         Args:
-            state: Single state vector [state_dim]
+            state: Batch of state vectors [batch_size, state_dim]
             epsilon: Small step size for finite difference
-            
+
         Returns:
-            Gradient vector [state_dim]
+            Gradient matrix [batch_size, state_dim]
         """
-        # Create a detached copy of the state
-        state_np = state.detach().cpu().numpy()
-        state_dim = state_np.shape[0]
-        gradient = np.zeros(state_dim)
-        
-        # Compute base CLF value for unperturbed state
-        base_state = torch.tensor(state_np, dtype=torch.float32).unsqueeze(0)
+        batch_size, state_dim = state.shape
+        gradients = torch.zeros_like(state)
+
         with torch.no_grad():
-            base_value = self.compute_clf(base_state).item()
-        
-        # Compute finite difference approximation of gradient
-        for i in range(state_dim):
-            # Create perturbed state (only perturb one dimension at a time)
-            perturbed_state_np = state_np.copy()
-            perturbed_state_np[i] += epsilon
-            
-            # Compute CLF value for perturbed state
-            perturbed_state = torch.tensor(perturbed_state_np, dtype=torch.float32).unsqueeze(0)
-            with torch.no_grad():
-                perturbed_value = self.compute_clf(perturbed_state).item()
-            
-            # Compute partial derivative
-            gradient[i] = (perturbed_value - base_value) / epsilon
-        
-        return torch.tensor(gradient, dtype=torch.float32, device=state.device)
+            base_values = self.compute_clf(state)  # [batch, 1]
+
+            for i in range(state_dim):
+                perturbed = state.clone()
+                perturbed[:, i] += epsilon
+                perturbed_values = self.compute_clf(perturbed)  # [batch, 1]
+                gradients[:, i] = ((perturbed_values - base_values) / epsilon).squeeze(1)
+
+        return gradients
     
     def lie_derivatives(
         self, 
@@ -354,13 +322,10 @@ class CLFNetworkLightning(pl.LightningModule):
         
         # Check where L_g_V has significant magnitude
         L_g_V_norm = torch.norm(L_g_V, dim=1, keepdim=True)
-        significant_control = L_g_V_norm > epsilon
         
-        # For points with significant control authority, compute u = -L_g_V.T / (L_g_V_norm + epsilon)
-        # This normalizes the control to avoid excessive magnitudes
-        u = torch.zeros_like(L_g_V)
-        u[significant_control.repeat(1, L_g_V.shape[1])] = -L_g_V[significant_control.repeat(1, L_g_V.shape[1])]
-        u = u / (L_g_V_norm + epsilon)
+        # For points with significant control authority, compute u = -L_g_V / (L_g_V_norm + epsilon)
+        # epsilon in the denominator handles near-zero norms; no masking needed (R2)
+        u = -L_g_V / (L_g_V_norm + epsilon)
         
         # Compute Lie derivative with the computed control
         L_dot = L_f_V + torch.sum(L_g_V * u, dim=1, keepdim=True)
@@ -380,116 +345,73 @@ class CLFNetworkLightning(pl.LightningModule):
         
         return lambda_lie * lie_loss
     
-    def training_step(
-        self, 
-        batch: Dict[str, torch.Tensor], 
-        batch_idx: int
+    def _shared_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        stage: str,
     ) -> Dict[str, torch.Tensor]:
         """
-        Training step for PyTorch Lightning.
-        
+        Shared logic for training, validation, and test steps (R3).
+
         Args:
-            batch: Dictionary containing states and optionally dynamics_model
-            batch_idx: Index of the current batch
-            
+            batch: Dictionary containing states
+            stage: One of 'train', 'val', 'test'
+
         Returns:
-            Dictionary with loss and logs
+            Dictionary with loss value
         """
         states = batch["states"]
-        
-        # Compute basic CLF loss (positive definiteness)
+
+        on_step = stage == "train"
+        prog_bar = stage != "test"
+
         clf_loss = self.compute_clf_loss(states)
-        
         total_loss = clf_loss
-        
-        # If dynamics model is provided, compute Lie derivative loss
-        if "dynamics_model" in batch:
-            dynamics_model = batch["dynamics_model"]
+
+        # Access dynamics model stored on this module (not in the batch) (C2)
+        dynamics_model = getattr(self, "dynamics_model", None)
+        if dynamics_model is not None:
             lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
             total_loss = clf_loss + lie_loss
-            
-            # Log metrics
-            self.log("train_lie_loss", lie_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Log metrics
-        self.log("train_clf_loss", clf_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
+            self.log(
+                f"{stage}_lie_loss", lie_loss,
+                on_step=on_step, on_epoch=True, prog_bar=prog_bar, logger=True,
+            )
+
+        self.log(
+            f"{stage}_clf_loss", clf_loss,
+            on_step=on_step, on_epoch=True, prog_bar=prog_bar, logger=True,
+        )
+        self.log(
+            f"{stage}_loss", total_loss,
+            on_step=on_step, on_epoch=True, prog_bar=prog_bar, logger=True,
+        )
+
         return {"loss": total_loss}
-    
+
+    def training_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int
+    ) -> Dict[str, torch.Tensor]:
+        result = self._shared_step(batch, "train")
+        return {"loss": result["loss"]}
+
     def validation_step(
-        self, 
-        batch: Dict[str, torch.Tensor], 
+        self,
+        batch: Dict[str, torch.Tensor],
         batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        """
-        Validation step for PyTorch Lightning.
-        
-        Args:
-            batch: Dictionary containing states and optionally dynamics_model
-            batch_idx: Index of the current batch
-            
-        Returns:
-            Dictionary with loss and logs
-        """
-        states = batch["states"]
-        
-        # Compute basic CLF loss (positive definiteness)
-        clf_loss = self.compute_clf_loss(states)
-        
-        total_loss = clf_loss
-        
-        # If dynamics model is provided, compute Lie derivative loss
-        if "dynamics_model" in batch:
-            dynamics_model = batch["dynamics_model"]
-            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-            total_loss = clf_loss + lie_loss
-            
-            # Log metrics
-            self.log("val_lie_loss", lie_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Log metrics
-        self.log("val_clf_loss", clf_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
-        return {"val_loss": total_loss}
-    
+        result = self._shared_step(batch, "val")
+        return {"val_loss": result["loss"]}
+
     def test_step(
-        self, 
-        batch: Dict[str, torch.Tensor], 
+        self,
+        batch: Dict[str, torch.Tensor],
         batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        """
-        Test step for PyTorch Lightning.
-        
-        Args:
-            batch: Dictionary containing states and optionally dynamics_model
-            batch_idx: Index of the current batch
-            
-        Returns:
-            Dictionary with loss and logs
-        """
-        states = batch["states"]
-        
-        # Compute basic CLF loss (positive definiteness)
-        clf_loss = self.compute_clf_loss(states)
-        
-        total_loss = clf_loss
-        
-        # If dynamics model is provided, compute Lie derivative loss
-        if "dynamics_model" in batch:
-            dynamics_model = batch["dynamics_model"]
-            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-            total_loss = clf_loss + lie_loss
-            
-            # Log metrics
-            self.log("test_lie_loss", lie_loss, on_step=False, on_epoch=True, logger=True)
-        
-        # Log metrics
-        self.log("test_clf_loss", clf_loss, on_step=False, on_epoch=True, logger=True)
-        self.log("test_loss", total_loss, on_step=False, on_epoch=True, logger=True)
-        
-        return {"test_loss": total_loss}
+        result = self._shared_step(batch, "test")
+        return {"test_loss": result["loss"]}
     
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """

@@ -7,8 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, List, Dict, Any, Optional, Union
 import pytorch_lightning as pl
-import numpy as np
-import wandb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -50,7 +48,10 @@ class ControlAffineNetworkLightning(pl.LightningModule):
         self.dropout_rate = dropout_rate
         self.learning_rate = learning_rate
         self.dt = dt
-        
+
+        # Needed so _log_predictions_wandb doesn't raise AttributeError (C3)
+        self.trajectory_counter = 0
+
         # Shared layers with dropout
         self.shared_layers = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -278,7 +279,7 @@ class ControlAffineNetworkLightning(pl.LightningModule):
                     "trajectory": self.trajectory_counter,
                     "epoch": self.current_epoch
                 }
-                wandb.log(metrics)
+                self.logger.experiment.log(metrics, step=self.global_step)
 
 
 class DynamicsEnsembleLightning(pl.LightningModule):
@@ -288,14 +289,15 @@ class DynamicsEnsembleLightning(pl.LightningModule):
     """
     
     def __init__(
-        self, 
-        state_dim: int, 
-        action_dim: int, 
+        self,
+        state_dim: int,
+        action_dim: int,
         hidden_dim: int = 64,
         ensemble_size: int = 5,
         dropout_rate: float = 0.1,
         learning_rate: float = 1e-3,
         dt: float = 0.05,
+        epochs_per_trajectory: int = 5,
         # Variance normalization parameters
         static_norm_k: float = 2.0,
         dynamic_norm_c0: float = 0.05,
@@ -304,7 +306,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
     ) -> None:
         """
         Initialize the dynamics ensemble.
-        
+
         Args:
             state_dim: Dimension of the state space
             action_dim: Dimension of the action space
@@ -313,6 +315,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             dropout_rate: Dropout probability for regularization
             learning_rate: Learning rate for optimizer
             dt: Time step for Euler integration
+            epochs_per_trajectory: Epochs per trajectory (for trajectory boundary detection)
             static_norm_k: Scaling parameter for static normalization: 1-exp(-k*var)
             dynamic_norm_c0: Initial value for dynamic normalization parameter
             dynamic_norm_alpha: Learning rate for dynamic normalization parameter update
@@ -328,13 +331,20 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         self.dropout_rate = dropout_rate
         self.learning_rate = learning_rate
         self.dt = dt
-        
+
+        # Epochs per trajectory used for trajectory boundary detection (L3)
+        self._epochs_per_trajectory = epochs_per_trajectory
+
         # Variance normalization parameters
         self.static_norm_k = static_norm_k
-        self.dynamic_norm_c = dynamic_norm_c0  # Current value of c_t
-        self.dynamic_norm_c0 = dynamic_norm_c0  # Initial value for c_t
+        self.dynamic_norm_c0 = dynamic_norm_c0
         self.dynamic_norm_alpha = dynamic_norm_alpha
         self.variance_buffer_size = variance_buffer_size
+
+        # Register as buffer so it survives checkpoint/resume (M1)
+        self.register_buffer(
+            "dynamic_norm_c", torch.tensor(dynamic_norm_c0, dtype=torch.float32)
+        )
         
         # Buffer to store variance history for median calculation
         self.variance_history: List[float] = []
@@ -505,31 +515,33 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         """
         return variance / (variance + self.dynamic_norm_c)
     
-    def update_dynamic_normalization_parameter(self, variance: torch.Tensor) -> None:
+    def update_dynamic_normalization_parameter(self, variance: torch.Tensor) -> float:
         """
         Update the dynamic normalization parameter c_t based on the median of variance values.
         Formula: c_t+1 = (1-alpha) * c_t + alpha * var_median(t+1)
-        
+
         Args:
             variance: Current batch of variance values
+
+        Returns:
+            var_median: The median used in this update (avoids recomputing it in callers)
         """
-        # Flatten the variance tensor and convert to list
         flat_variance = variance.flatten().cpu().tolist()
-        
-        # Add to the variance history buffer
+
         self.variance_history.extend(flat_variance)
-        
-        # Maintain the buffer size limit
+
         if len(self.variance_history) > self.variance_buffer_size:
-            # Keep only the most recent values
             self.variance_history = self.variance_history[-self.variance_buffer_size:]
-        
-        # Calculate median of the variance history
-        var_median = torch.tensor(self.variance_history).median().item()
-        
-        # Update c_t using the exponential moving average formula
-        self.dynamic_norm_c = (1 - self.dynamic_norm_alpha) * self.dynamic_norm_c + \
-                              self.dynamic_norm_alpha * var_median
+
+        var_median = float(torch.tensor(self.variance_history).median().item())
+
+        # dynamic_norm_c is a registered buffer (tensor); update in-place (M1)
+        self.dynamic_norm_c.fill_(
+            (1 - self.dynamic_norm_alpha) * self.dynamic_norm_c.item()
+            + self.dynamic_norm_alpha * var_median
+        )
+
+        return var_median
     
     def compute_loss(
         self,
@@ -648,9 +660,9 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         Used to track when a new trajectory is collected and update variance normalization parameters.
         """
         super().on_train_epoch_start()
-        
-        # Get configuration parameters for trajectory handling
-        epochs_per_trajectory = self.trainer.datamodule.hparams.get('epochs_per_trajectory', 5) if hasattr(self.trainer, 'datamodule') else 5
+
+        # Use the per-trajectory epoch count stored on this model (L3)
+        epochs_per_trajectory = self._epochs_per_trajectory
         
         # Initialize on first epoch
         if self.current_epoch == 0:
@@ -662,8 +674,8 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             if isinstance(self.logger, pl.loggers.WandbLogger):
                 self.logger.experiment.log({
                     "trajectory": self.trajectory_counter,
-                    "dynamic_norm_parameter_c": self.dynamic_norm_c
-                })
+                    "dynamic_norm_parameter_c": self.dynamic_norm_c.item()
+                }, step=self.global_step)
             
             print(f"Starting trajectory {self.trajectory_counter+1} at epoch {self.current_epoch}")
         
@@ -679,9 +691,9 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             if isinstance(self.logger, pl.loggers.WandbLogger):
                 self.logger.experiment.log({
                     "trajectory": self.trajectory_counter,
-                    "dynamic_norm_parameter_c": self.dynamic_norm_c,
-                    "new_trajectory_marker": 1.0  # Add marker to easily identify new trajectories in plots
-                })
+                    "dynamic_norm_parameter_c": self.dynamic_norm_c.item(),
+                    "new_trajectory_marker": 1.0
+                }, step=self.global_step)
             
             print(f"Starting trajectory {self.trajectory_counter+1} at epoch {self.current_epoch}")
             
@@ -719,8 +731,8 @@ class DynamicsEnsembleLightning(pl.LightningModule):
                     "trajectory": self.trajectory_counter,
                     "epoch": self.current_epoch
                 }
-                wandb.log(metrics)
-    
+                self.logger.experiment.log(metrics, step=self.global_step)
+
     def _log_uncertainty_wandb(
         self, 
         states: torch.Tensor, 
@@ -748,27 +760,21 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             mean_static_norm = static_norm_variance.mean().item()
             mean_dynamic_norm = dynamic_norm_variance.mean().item()
             
-            # Update dynamic normalization parameter
-            self.update_dynamic_normalization_parameter(raw_variance)
-            
-            # Get current median value for logging
-            var_median = torch.tensor(self.variance_history).median().item()
-            
+            # Update dynamic normalization parameter; use returned median to avoid recomputing (W2)
+            var_median = self.update_dynamic_normalization_parameter(raw_variance)
+
             # Log essential metrics to wandb with trajectory information
             if isinstance(self.logger, pl.loggers.WandbLogger):
                 # Log the current variance values for this epoch
                 metrics = {
                     "raw_variance_mean": mean_raw_variance,
-                    "static_norm_variance_mean": mean_static_norm, 
+                    "static_norm_variance_mean": mean_static_norm,
                     "dynamic_norm_variance_mean": mean_dynamic_norm,
                     "variance_median": var_median,
-                    "dynamic_norm_parameter_c": self.dynamic_norm_c,
+                    "dynamic_norm_parameter_c": self.dynamic_norm_c.item(),
                     "trajectory": self.trajectory_counter,
                     "epoch": self.current_epoch
                 }
-                
+
                 # Calculate trajectory-level metrics (average of all epochs in a trajectory)
-                # This is a running calculation that will be finalized at the end of the trajectory
-                wandb.log(metrics)
-                
-                # Skip creating the bar charts and other visualizations that aren't needed
+                self.logger.experiment.log(metrics, step=self.global_step)

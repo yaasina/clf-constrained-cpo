@@ -201,21 +201,14 @@ class CLFDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a sample from the dataset.
-        
+
         Args:
             idx: Index of the sample
-            
+
         Returns:
-            Dictionary containing states and optionally dynamics_model
+            Dictionary containing the state vector
         """
-        sample = {
-            "states": self.states[idx]
-        }
-        
-        if self.dynamics_model is not None:
-            sample["dynamics_model"] = self.dynamics_model
-            
-        return sample
+        return {"states": self.states[idx]}
     
     def normalize_data(self) -> None:
         """Normalize the data to have zero mean and unit variance."""

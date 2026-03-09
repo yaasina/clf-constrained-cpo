@@ -164,23 +164,20 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
             else:
                 raise ValueError("Neither environment nor data path specified for training")
         
-        # Create data module
-        data_module_params = {
-            "_target_": DynamicsDataModule,
-            "batch_size": batch_size,
-            "num_workers": config.experiment.training.get("num_workers", 4),
-            "normalize": config.experiment.dynamics.get("normalize_data", True),
-            "random_seed": config.seed,
-            "states": states,
-            "actions": actions,
-            "next_states": next_states,
-            "persistent_workers": config.experiment.data.get("persistent_workers", False),
-            "train_ratio": config.experiment.data.get("train_ratio", 0.8),
-            "val_ratio": config.experiment.data.get("val_ratio", 0.1),
-            "test_ratio": config.experiment.data.get("test_ratio", 0.1),
-        }
-        
-        data_module = hydra.utils.instantiate(data_module_params, _recursive_=False)
+        # Create data module (direct instantiation - avoids _target_ string issues) (L4)
+        data_module = DynamicsDataModule(
+            batch_size=batch_size,
+            num_workers=config.experiment.training.get("num_workers", 4),
+            normalize=config.experiment.dynamics.get("normalize_data", True),
+            random_seed=config.seed,
+            states=states,
+            actions=actions,
+            next_states=next_states,
+            persistent_workers=config.experiment.data.get("persistent_workers", False),
+            train_ratio=config.experiment.data.get("train_ratio", 0.8),
+            val_ratio=config.experiment.data.get("val_ratio", 0.1),
+            test_ratio=config.experiment.data.get("test_ratio", 0.1),
+        )
         data_module.prepare_data()
         data_module.setup()
         
@@ -234,10 +231,6 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
         # Update total epochs trained
         total_epochs_trained += epochs_per_trajectory
         
-        # Update the model's trajectory counter if it supports it
-        if hasattr(model, 'trajectory_counter'):
-            model.trajectory_counter = traj_idx + 1
-            
         # Log trajectory completion
         if isinstance(logger, pl.loggers.WandbLogger):
             logger.experiment.log({
@@ -293,33 +286,39 @@ def train_clf_model(
         group=config.logger.group
     )
     
-    # Extract only the parameters that CLFDataModule accepts
-    data_module_params = {
-        "_target_": CLFDataModule,
-        "batch_size": config.experiment.training.get("batch_size", config.training.batch_size),
-        "num_workers": config.experiment.training.get("num_workers", 4),
-        "normalize": config.experiment.dynamics.get("normalize_data", True),
-        "random_seed": config.seed,
-        "dynamics_model": dynamics_model,
-        "persistent_workers": config.experiment.data.get("persistent_workers", False)
-    }
-    
-    # If data paths are specified, add them
+    # --------------- state generation / loading ---------------
+    states = None
+
     if hasattr(config.experiment.data, "data_path") and config.experiment.data.data_path:
-        data_module_params["data_path"] = config.experiment.data.data_path
-        
-    # Add train/val/test ratios if specified
-    if hasattr(config.experiment.data, "train_ratio"):
-        data_module_params["train_ratio"] = config.experiment.data.train_ratio
-    if hasattr(config.experiment.data, "val_ratio"):
-        data_module_params["val_ratio"] = config.experiment.data.val_ratio
-    if hasattr(config.experiment.data, "test_ratio"):
-        data_module_params["test_ratio"] = config.experiment.data.test_ratio
-    
-    # Load data
-    data_module = hydra.utils.instantiate(
-        data_module_params,
-        _recursive_=False,
+        # Load states from file
+        print(f"Loading CLF states from {config.experiment.data.data_path}")
+        data = torch.load(config.experiment.data.data_path)
+        states = data.get("states")
+    elif dynamics_model is not None and hasattr(dynamics_model, "state_dim"):
+        # Generate random states by sampling uniformly within a configurable range (L2)
+        state_dim = dynamics_model.state_dim
+        n_samples = config.experiment.data.get("n_clf_samples", 5000)
+        state_range = config.experiment.data.get("clf_state_range", 3.0)
+        states = (torch.rand(n_samples, state_dim) * 2 - 1) * state_range
+        print(f"Generated {n_samples} random CLF training states "
+              f"in [{-state_range}, {state_range}]^{state_dim}")
+    else:
+        raise ValueError(
+            "CLF training requires either experiment.data.data_path or a dynamics_model "
+            "with a state_dim attribute to generate states from."
+        )
+
+    # Direct instantiation — avoids _target_ string issues (L4)
+    data_module = CLFDataModule(
+        states=states,
+        batch_size=config.experiment.training.get("batch_size", config.training.batch_size),
+        num_workers=config.experiment.training.get("num_workers", 4),
+        normalize=config.experiment.dynamics.get("normalize_data", True),
+        random_seed=config.seed,
+        persistent_workers=config.experiment.data.get("persistent_workers", False),
+        train_ratio=config.experiment.data.get("train_ratio", 0.8),
+        val_ratio=config.experiment.data.get("val_ratio", 0.1),
+        test_ratio=config.experiment.data.get("test_ratio", 0.1),
     )
     
     # Setup the data module to access the dimensions
@@ -345,6 +344,9 @@ def train_clf_model(
     
     # Initialize model with dynamic dimensions
     model = hydra.utils.instantiate(model_config)
+
+    # Attach dynamics model so training_step can access it without putting it in batches (C2)
+    model.dynamics_model = dynamics_model
     
     # Log the inferred dimensions
     logger.experiment.config.update({
