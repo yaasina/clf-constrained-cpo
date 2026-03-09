@@ -1,28 +1,3 @@
-# Neural Control Lyapunov Function (Neural CLF)
-
-A Python framework for learning control-affine dynamics models and control Lyapunov functions for nonlinear systems using PyTorch Lightning and Hydra.
-
-## Project Overview
-
-This project implements a two-stage learning approach for nonlinear control systems:
-
-1. **Dynamics Learning**: Learn control-affine dynamics models using neural networks in an ensemble fashion to capture uncertainty
-2. **CLF Learning**: Learn a Control Lyapunov Function (CLF) with a QP-based controller to stabilize the learned dynamics
-
-The framework is designed to work with continuous control environments from Gymnasium and can be extended to custom environments.
-
-## Features
-
-- PyTorch Lightning implementation for better code organization and reproducibility
-- Hydra configuration for flexible experiment setup
-- Weights & Biases integration for experiment tracking and visualization
-- Ensemble-based learning of control-affine dynamics
-- Uncertainty quantification through model ensembles
-- Neural network-based CLF representation
-- QP-based optimal control policy with cvxpylayers for differentiable optimization
-- Comprehensive visualization suite with Plotly
-- Support for various environments
-
 ## Installation
 
 ### Option 1: Using Conda (Recommended)
@@ -227,16 +202,8 @@ To use your own environments:
      state_dim: <your_state_dim>
      action_dim: <your_action_dim>
      data_path: /path/to/your/data.pt
+ 
    ```
-
-## Mathematical Background
-
-For a detailed understanding of the mathematical foundations of this project, refer to `dynamics_learning_explanation.md` which covers:
-- Control affine systems representation
-- Neural network design for dynamics learning
-- Ensemble methods for uncertainty quantification
-- CLF theory and implementation details
-
 ## Troubleshooting
 
 ### Common Issues
@@ -267,27 +234,3 @@ For a detailed understanding of the mathematical foundations of this project, re
    # Later, sync the results
    wandb sync ./wandb/run-*
    ```
-
-### Getting Help
-
-If you encounter issues not covered here, please check:
-- The documentation in the source code
-- The mathematical background in `dynamics_learning_explanation.md`
-- The PyTorch Lightning documentation: https://lightning.ai/docs/pytorch/stable/
-- The Hydra documentation: https://hydra.cc/docs/intro/
-
-## License
-
-[MIT License](LICENSE)
-
-## Citation
-
-If you use this code in your research, please cite:
-```
-@software{neural_clf,
-  author = {Author},
-  title = {Neural Control Lyapunov Functions for Nonlinear Control},
-  year = {2023},
-  url = {https://github.com/username/neural_clf}
-}
-```

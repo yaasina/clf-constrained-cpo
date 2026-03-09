@@ -23,18 +23,19 @@ class CLFNetworkLightning(pl.LightningModule):
     """
     
     def __init__(
-        self, 
-        state_dim: int, 
+        self,
+        state_dim: int,
         hidden_dim: int = 64,
         dropout_rate: float = 0.1,
         learning_rate: float = 1e-3,
         nonlinearity: nn.Module = nn.Tanh(),
         output_nonlinearity: Optional[nn.Module] = None,
-        loss: Optional[Dict[str, float]] = None
+        loss: Optional[Dict[str, float]] = None,
+        equilibrium: Optional[torch.Tensor] = None
     ) -> None:
         """
         Initialize the CLF network.
-        
+
         Args:
             state_dim: Dimension of the state space
             hidden_dim: Dimension of hidden layers
@@ -43,22 +44,31 @@ class CLFNetworkLightning(pl.LightningModule):
             nonlinearity: Activation function for hidden layers
             output_nonlinearity: Activation function for output layer (None for linear output)
             loss: Dictionary of loss hyperparameters (alpha1, alpha2, alpha3, alpha4)
+            equilibrium: Equilibrium state tensor [state_dim]. Defaults to the zero vector.
+                         Registered as a buffer so it moves with the model and is saved
+                         in checkpoints.
         """
         super().__init__()
-        
-        self.save_hyperparameters()
-        
+
+        # Exclude nn.Module args and tensor from hyperparameter serialization (C4 / L6)
+        self.save_hyperparameters(ignore=["nonlinearity", "output_nonlinearity", "equilibrium"])
+
         self.state_dim = state_dim
         self.output_nonlinearity = output_nonlinearity
         self.learning_rate = learning_rate
-        
+
         # Set loss hyperparameters with defaults
         self.loss_params = loss or {}
         self.alpha1 = self.loss_params.get('alpha1', 1.0)
         self.alpha2 = self.loss_params.get('alpha2', 0.1)
         self.alpha3 = self.loss_params.get('alpha3', 1.0)
         self.alpha4 = self.loss_params.get('alpha4', 1.0)
-        
+
+        # Register equilibrium as a buffer so it moves to the right device automatically
+        # and is saved / restored with the checkpoint (L6)
+        _eq = equilibrium.clone().detach().float() if equilibrium is not None else torch.zeros(state_dim)
+        self.register_buffer("equilibrium", _eq)
+
         # Define neural network architecture with dropout
         self.layers = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -85,8 +95,8 @@ class CLFNetworkLightning(pl.LightningModule):
         """
         # For equilibrium point (origin), ensure output is exactly zero
         if torch.all(torch.abs(state) < 1e-6):
-            # Create a zero tensor that maintains the computational graph connection
-            return torch.zeros(state.shape[0], 1, device=state.device, requires_grad=True) + state.sum() * 0.0
+            # Keep the computational graph alive through state so gradients can flow
+            return torch.zeros(state.shape[0], 1, device=state.device) + state.sum() * 0.0
         
         # Normal forward pass through the network layers
         output = self.layers(state)
@@ -100,67 +110,41 @@ class CLFNetworkLightning(pl.LightningModule):
     def compute_clf(self, state: torch.Tensor) -> torch.Tensor:
         """
         Compute the Control Lyapunov Function value L(x) = 0.5 * (NN(x))^2.
-        
+
         Args:
             state: Batch of state vectors [batch_size, state_dim]
-            
+
         Returns:
             CLF values [batch_size, 1]
         """
-        # Ensure we're using a tensor with requires_grad=True for gradient computation
-        if not state.requires_grad:
-            state = state.clone().requires_grad_(True)
-        
-        # Get neural network output
         nn_output = self(state)
-        
+
         # Calculate V(x) = 0.5 * (NN(x))^2
         clf_value = 0.5 * torch.pow(nn_output, 2)
-        
+
         return clf_value
     
     def gradient(self, state: torch.Tensor) -> torch.Tensor:
         """
         Compute the gradient of the CLF with respect to the state.
-        
+
+        Uses a single vectorised autograd call over the entire batch:
+        d(ΣᵢV(xᵢ))/d(xⱼ) = dV(xⱼ)/d(xⱼ) because the network has no
+        cross-sample interactions.  This replaces an O(N) per-sample loop
+        (G2) and eliminates the wasted full-batch forward pass (G3) and
+        the in-place assignment to a zeros tensor (G1).
+
         Args:
             state: Batch of state vectors [batch_size, state_dim]
-            
+
         Returns:
             Gradient of L(x) with respect to x [batch_size, state_dim]
         """
-        # Create a fresh tensor with requires_grad=True
-        state_with_grad = state.detach().clone().requires_grad_(True)
-        
-        # Run a forward pass
-        clf_value = self.compute_clf(state_with_grad)
-        
-        # Create gradients tensor of same shape as state tensor
-        gradients = torch.zeros_like(state_with_grad)
-        
-        # Compute gradients for each sample separately to avoid graph issues
-        for i in range(state_with_grad.shape[0]):
-            single_state = state_with_grad[i:i+1]  # Keep batch dimension
-            
-            # Do another forward pass for this specific sample
-            single_clf_value = self.compute_clf(single_state)
-            
-            try:
-                # Compute gradient using autograd
-                grad_outputs = torch.ones_like(single_clf_value)
-                single_grad = torch.autograd.grad(
-                    outputs=single_clf_value,
-                    inputs=single_state,
-                    grad_outputs=grad_outputs,
-                    create_graph=True,
-                    retain_graph=True
-                )[0]
-                
-                gradients[i] = single_grad
-            except Exception:
-                # Use finite differences as fallback for this sample
-                gradients[i] = self._compute_gradient_fd(single_state.squeeze(0))
-        
+        state_grad = state.detach().clone().requires_grad_(True)
+        clf_sum = self.compute_clf(state_grad).sum()
+        gradients = torch.autograd.grad(
+            clf_sum, state_grad, create_graph=True
+        )[0]
         return gradients
     
     def _compute_gradient_fd(self, state: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
@@ -367,11 +351,9 @@ class CLFNetworkLightning(pl.LightningModule):
         L_g_V_norm = torch.norm(L_g_V, dim=1, keepdim=True)
         significant_control = L_g_V_norm > epsilon
         
-        # For points with significant control authority, compute u = -L_g_V.T / (L_g_V_norm + epsilon)
-        # This normalizes the control to avoid excessive magnitudes
-        u = torch.zeros_like(L_g_V)
-        u[significant_control.repeat(1, L_g_V.shape[1])] = -L_g_V[significant_control.repeat(1, L_g_V.shape[1])]
-        u = u / (L_g_V_norm + epsilon)
+        # For points with significant control authority, compute u = -L_g_V / (L_g_V_norm + eps)
+        # This normalises the control direction without requiring boolean indexing (R2)
+        u = -L_g_V / (L_g_V_norm + epsilon)
         
         # Compute Lie derivative with the computed control
         L_dot = L_f_V + torch.sum(L_g_V * u, dim=1, keepdim=True)
@@ -420,38 +402,35 @@ class CLFNetworkLightning(pl.LightningModule):
         """
         batch_size = states.shape[0]
         device = states.device
-        
-        # Term 1: V_θ(0) - Minimize the CLF value at the equilibrium point
-        # For pendulum, the equilibrium is [cos(θ)=1, sin(θ)=0, θ̇=0] = [1, 0, 0]
-        from pendulum_utils import get_pendulum_equilibrium
-        equilibrium_state = get_pendulum_equilibrium().to(device)
-        equilibrium_value = self.compute_clf(equilibrium_state.unsqueeze(0))
+
+        # Term 1: V_θ(eq) — CLF value at equilibrium should be 0.
+        # Use self.equilibrium buffer; no hard-coded pendulum import (L6).
+        equilibrium_value = self.compute_clf(self.equilibrium.to(device).unsqueeze(0))
         loss_equilibrium = alpha1 * equilibrium_value
-        
-        # Compute Lie derivatives for the batch
+
+        # Compute Lie derivatives for the batch once — reused in Term 3 (G5)
         L_f_V, L_g_V = self.lie_derivatives(states, dynamics_model)
-        
-        # Solve QP for each state in the batch to get optimal controls and relaxation variables
-        # We need to solve: min ||u||² + λr subject to L_f V + L_g V u + γV ≤ r, r ≥ 0
+
+        # Solve QP for each state to get optimal controls and relaxation variables
         qp_results = qp_solver.solve_batch(states, self, dynamics_model, batch_size=batch_size)
-        
-        # Extract optimal controls and relaxation variables
-        u_values = qp_results['u_values']
-        r_values = qp_results['r_values']
-        
-        # Term 2: (α₂/B)∑ᵢr_i - Minimize the relaxation variables
-        loss_relaxation = alpha2 * torch.mean(r_values)
-        
-        # Term 3: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0) - Enforce negative Lie derivative
-        lie_derivatives = []
-        for i in range(batch_size):
-            state = states[i:i+1]
-            control = u_values[i:i+1]
-            L_dot = self.compute_lie_derivative_with_action(state, control, dynamics_model)
-            lie_derivatives.append(L_dot)
-        
-        lie_derivatives = torch.cat(lie_derivatives)
-        loss_lie_derivative = alpha3 * torch.mean(torch.relu(lie_derivatives))
+
+        u_values = qp_results['u_values']  # [batch_size, action_dim]
+        r_values = qp_results['r_values']  # [batch_size] or [batch_size, 1]
+
+        # Term 2: (α₂/B)∑ᵢrᵢ — minimise relaxation variables.
+        # Filter inf values produced by failed QP solves to keep loss finite (L7).
+        valid_r = r_values[~torch.isinf(r_values)]
+        if valid_r.numel() > 0:
+            loss_relaxation = alpha2 * valid_r.mean()
+        else:
+            loss_relaxation = torch.tensor(0.0, device=device, requires_grad=False)
+
+        # Term 3: (α₃/B)∑ᵢmax(L_f V + L_g V·uᵢ, 0) — reuse already-computed L_f_V, L_g_V (G5)
+        # u_values needs to be broadcastable with L_g_V [batch_size, action_dim]
+        if u_values.dim() == 1:
+            u_values = u_values.unsqueeze(-1)
+        L_dot = L_f_V + torch.sum(L_g_V * u_values, dim=1, keepdim=True)
+        loss_lie_derivative = alpha3 * torch.relu(L_dot).mean()
         
         # Term 4: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0) - Ensure CLF decreases over time
         loss_temporal = torch.tensor(0.0, device=device)
@@ -476,237 +455,106 @@ class CLFNetworkLightning(pl.LightningModule):
             "loss_temporal": loss_temporal
         }
     
+    def _shared_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        stage: str
+    ) -> torch.Tensor:
+        """
+        Shared logic for training, validation, and test steps (R3).
+
+        Dynamics model and QP solver are sourced from self.dynamics_model /
+        self.qp_solver (set by training.py before trainer.fit), NOT from the
+        batch dict, which only ever contains states (C5).
+
+        Three tiers:
+          1. Both dynamics_model and qp_solver → full self-supervised CLF loss.
+          2. Only dynamics_model → CLF positive-definiteness + Lie derivative loss.
+          3. Neither → basic CLF positive-definiteness loss only.
+
+        Args:
+            batch: Batch dict from the dataloader (contains "states")
+            stage: One of "train", "val", "test"
+
+        Returns:
+            Total scalar loss tensor
+        """
+        states = batch["states"]
+        on_step = (stage == "train")
+
+        dynamics_model = getattr(self, "dynamics_model", None)
+        qp_solver = getattr(self, "qp_solver", None)
+
+        if dynamics_model is not None and qp_solver is not None:
+            next_states = batch.get("next_states", None)
+            dt = batch.get("dt", 0.05)
+
+            loss_dict = self.compute_self_supervised_clf_loss(
+                states=states,
+                dynamics_model=dynamics_model,
+                qp_solver=qp_solver,
+                next_states=next_states,
+                dt=dt,
+                alpha1=self.alpha1,
+                alpha2=self.alpha2,
+                alpha3=self.alpha3,
+                alpha4=self.alpha4 if next_states is not None else 0.0
+            )
+            total_loss = loss_dict["loss"]
+            self.log(f"{stage}_loss", total_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"{stage}_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=on_step, on_epoch=True, logger=True)
+            self.log(f"{stage}_loss_relaxation", loss_dict["loss_relaxation"], on_step=on_step, on_epoch=True, logger=True)
+            self.log(f"{stage}_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=on_step, on_epoch=True, logger=True)
+            if next_states is not None:
+                self.log(f"{stage}_loss_temporal", loss_dict["loss_temporal"], on_step=on_step, on_epoch=True, logger=True)
+
+        elif dynamics_model is not None:
+            clf_loss = self.compute_clf_loss(states)
+            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
+            total_loss = clf_loss + lie_loss
+            self.log(f"{stage}_clf_loss", clf_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"{stage}_lie_loss", lie_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"{stage}_loss", total_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)
+
+        else:
+            total_loss = self.compute_clf_loss(states)
+            self.log(f"{stage}_clf_loss", total_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"{stage}_loss", total_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)
+
+        return total_loss
+
     def training_step(
-        self, 
-        batch: Dict[str, torch.Tensor], 
+        self,
+        batch: Dict[str, torch.Tensor],
         batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        """
-        Training step for PyTorch Lightning.
-        
-        Args:
-            batch: Dictionary containing states, dynamics_model, and qp_solver
-            batch_idx: Index of the current batch
-            
-        Returns:
-            Dictionary with loss and logs
-        """
-        states = batch["states"]
-        
-        # If dynamics model is provided, use self-supervised learning with the CLF loss
-        if "dynamics_model" in batch and "qp_solver" in batch:
-            dynamics_model = batch["dynamics_model"]
-            qp_solver = batch["qp_solver"]
-            
-            # Get next states if they are available for temporal difference term
-            next_states = batch.get("next_states", None)
-            dt = batch.get("dt", 0.05)  # Default dt if not provided
-            
-            # Compute self-supervised CLF loss
-            loss_dict = self.compute_self_supervised_clf_loss(
-                states=states,
-                dynamics_model=dynamics_model,
-                qp_solver=qp_solver,
-                next_states=next_states,
-                dt=dt,
-                alpha1=self.alpha1,  # Weight for equilibrium term
-                alpha2=self.alpha2,  # Weight for relaxation variable term
-                alpha3=self.alpha3,  # Weight for lie derivative term
-                alpha4=self.alpha4 if next_states is not None else 0.0  # Weight for CLF decrease over time term
-            )
-            
-            # Get the total loss and individual loss terms
-            total_loss = loss_dict["loss"]
-            
-            # Log all loss components
-            self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log("train_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=True, on_epoch=True, logger=True)
-            self.log("train_loss_relaxation", loss_dict["loss_relaxation"], on_step=True, on_epoch=True, logger=True)
-            self.log("train_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=True, on_epoch=True, logger=True)
-            
-            if next_states is not None:
-                self.log("train_loss_temporal", loss_dict["loss_temporal"], on_step=True, on_epoch=True, logger=True)
-            
-            return {"loss": total_loss}
-        
-        # Fallback to basic CLF loss when necessary components aren't available
-        else:
-            # Compute basic CLF loss (positive definiteness)
-            clf_loss = self.compute_clf_loss(states)
-            
-            total_loss = clf_loss
-            
-            # If only dynamics model is provided, compute Lie derivative loss
-            if "dynamics_model" in batch:
-                dynamics_model = batch["dynamics_model"]
-                lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-                total_loss = clf_loss + lie_loss
-                
-                # Log metrics
-                self.log("train_lie_loss", lie_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            
-            # Log metrics
-            self.log("train_clf_loss", clf_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            
-            return {"loss": total_loss}
-    
+        """Training step — delegates to _shared_step (R3)."""
+        return {"loss": self._shared_step(batch, "train")}
+
     def validation_step(
-        self, 
-        batch: Dict[str, torch.Tensor], 
+        self,
+        batch: Dict[str, torch.Tensor],
         batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        """
-        Validation step for PyTorch Lightning.
-        
-        Args:
-            batch: Dictionary containing states, dynamics_model, and qp_solver
-            batch_idx: Index of the current batch
-            
-        Returns:
-            Dictionary with loss and logs
-        """
-        states = batch["states"]
-        
-        # If dynamics model and QP solver are provided, use self-supervised learning with the CLF loss
-        if "dynamics_model" in batch and "qp_solver" in batch:
-            dynamics_model = batch["dynamics_model"]
-            qp_solver = batch["qp_solver"]
-            
-            # Get next states if they are available for temporal difference term
-            next_states = batch.get("next_states", None)
-            dt = batch.get("dt", 0.05)  # Default dt if not provided
-            
-            # Compute self-supervised CLF loss
-            loss_dict = self.compute_self_supervised_clf_loss(
-                states=states,
-                dynamics_model=dynamics_model,
-                qp_solver=qp_solver,
-                next_states=next_states,
-                dt=dt,
-                alpha1=self.alpha1,  # Weight for equilibrium term
-                alpha2=self.alpha2,  # Weight for relaxation variable term
-                alpha3=self.alpha3,  # Weight for lie derivative term
-                alpha4=self.alpha4 if next_states is not None else 0.0  # Weight for CLF decrease over time term
-            )
-            
-            # Get the total loss and individual loss terms
-            total_loss = loss_dict["loss"]
-            
-            # Log all loss components
-            self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log("val_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=False, on_epoch=True, logger=True)
-            self.log("val_loss_relaxation", loss_dict["loss_relaxation"], on_step=False, on_epoch=True, logger=True)
-            self.log("val_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=False, on_epoch=True, logger=True)
-            
-            if next_states is not None:
-                self.log("val_loss_temporal", loss_dict["loss_temporal"], on_step=False, on_epoch=True, logger=True)
-        
-        # Fallback to basic CLF loss when necessary components aren't available
-        else:
-            # Compute basic CLF loss (positive definiteness)
-            clf_loss = self.compute_clf_loss(states)
-            
-            total_loss = clf_loss
-            
-            # If only dynamics model is provided, compute Lie derivative loss
-            if "dynamics_model" in batch:
-                dynamics_model = batch["dynamics_model"]
-                lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-                total_loss = clf_loss + lie_loss
-                
-                # Log metrics
-                self.log("val_lie_loss", lie_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            
-            # Log metrics
-            self.log("val_clf_loss", clf_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
-        # If it's the first validation batch of an epoch, visualize CLF
+        """Validation step — delegates to _shared_step (R3)."""
+        loss = self._shared_step(batch, "val")
+
+        # On the first batch of each epoch, log visualizations
         if batch_idx == 0 and self.logger is not None and isinstance(self.logger, pl.loggers.WandbLogger):
-            self._log_clf_visualizations(states)
-            
-            # If dynamics model is provided, visualize Lie derivatives
-            if "dynamics_model" in batch:
-                dynamics_model = batch["dynamics_model"]
-                self._log_lie_derivative_visualizations(states, dynamics_model)
-        
-        return {"val_loss": total_loss}
-    
+            self._log_clf_visualizations(batch["states"])
+            dynamics_model = getattr(self, "dynamics_model", None)
+            if dynamics_model is not None:
+                self._log_lie_derivative_visualizations(batch["states"], dynamics_model)
+
+        return {"val_loss": loss}
+
     def test_step(
-        self, 
-        batch: Dict[str, torch.Tensor], 
+        self,
+        batch: Dict[str, torch.Tensor],
         batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        """
-        Test step for PyTorch Lightning.
-        
-        Args:
-            batch: Dictionary containing states, dynamics_model, and qp_solver
-            batch_idx: Index of the current batch
-            
-        Returns:
-            Dictionary with loss and logs
-        """
-        states = batch["states"]
-        
-        # If dynamics model and QP solver are provided, use self-supervised learning with the CLF loss
-        if "dynamics_model" in batch and "qp_solver" in batch:
-            dynamics_model = batch["dynamics_model"]
-            qp_solver = batch["qp_solver"]
-            
-            # Get next states if they are available for temporal difference term
-            next_states = batch.get("next_states", None)
-            dt = batch.get("dt", 0.05)  # Default dt if not provided
-            
-            # Compute self-supervised CLF loss
-            loss_dict = self.compute_self_supervised_clf_loss(
-                states=states,
-                dynamics_model=dynamics_model,
-                qp_solver=qp_solver,
-                next_states=next_states,
-                dt=dt,
-                alpha1=self.alpha1,  # Weight for equilibrium term
-                alpha2=self.alpha2,  # Weight for relaxation variable term
-                alpha3=self.alpha3,  # Weight for lie derivative term
-                alpha4=self.alpha4 if next_states is not None else 0.0  # Weight for CLF decrease over time term
-            )
-            
-            # Get the total loss and individual loss terms
-            total_loss = loss_dict["loss"]
-            
-            # Log all loss components
-            self.log("test_loss", total_loss, on_step=False, on_epoch=True, logger=True)
-            self.log("test_loss_equilibrium", loss_dict["loss_equilibrium"], on_step=False, on_epoch=True, logger=True)
-            self.log("test_loss_relaxation", loss_dict["loss_relaxation"], on_step=False, on_epoch=True, logger=True)
-            self.log("test_loss_lie_derivative", loss_dict["loss_lie_derivative"], on_step=False, on_epoch=True, logger=True)
-            
-            if next_states is not None:
-                self.log("test_loss_temporal", loss_dict["loss_temporal"], on_step=False, on_epoch=True, logger=True)
-            
-            return {"test_loss": total_loss}
-        
-        # Fallback to basic CLF loss when necessary components aren't available
-        else:
-            # Compute basic CLF loss (positive definiteness)
-            clf_loss = self.compute_clf_loss(states)
-            
-            total_loss = clf_loss
-            
-            # If only dynamics model is provided, compute Lie derivative loss
-            if "dynamics_model" in batch:
-                dynamics_model = batch["dynamics_model"]
-                lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-                total_loss = clf_loss + lie_loss
-                
-                # Log metrics
-                self.log("test_lie_loss", lie_loss, on_step=False, on_epoch=True, logger=True)
-            
-            # Log metrics
-            self.log("test_clf_loss", clf_loss, on_step=False, on_epoch=True, logger=True)
-            self.log("test_loss", total_loss, on_step=False, on_epoch=True, logger=True)
-            
-            return {"test_loss": total_loss}
+        """Test step — delegates to _shared_step (R3)."""
+        return {"test_loss": self._shared_step(batch, "test")}
     
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """
@@ -720,11 +568,13 @@ class CLFNetworkLightning(pl.LightningModule):
     def _log_clf_visualizations(self, states: torch.Tensor) -> None:
         """
         Log CLF visualizations to Weights & Biases.
-        
+
         Args:
             states: Batch of states [batch_size, state_dim]
         """
-        with torch.no_grad():
+        # gradient() uses autograd.grad; use enable_grad() so this is safe
+        # even if called from within a torch.no_grad() scope (C1).
+        with torch.enable_grad():
             # Compute CLF values
             clf_values = self.compute_clf(states)
             
@@ -754,7 +604,7 @@ class CLFNetworkLightning(pl.LightningModule):
                         
                         # Log to wandb
                         if isinstance(self.logger, pl.loggers.WandbLogger):
-                            wandb.log({"clf_surface": fig})
+                            self.logger.experiment.log({"clf_surface": fig}, step=self.global_step)
                 except:
                     # Not a grid, create scatter plot instead
                     pass
@@ -801,7 +651,7 @@ class CLFNetworkLightning(pl.LightningModule):
             
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"clf_vs_norm": fig})
+                self.logger.experiment.log({"clf_vs_norm": fig}, step=self.global_step)
             
             # Create gradient visualization
             if self.state_dim == 2:
@@ -854,7 +704,7 @@ class CLFNetworkLightning(pl.LightningModule):
                             size=5,
                             color="rgba(0,0,0,0)"
                         ),
-                        text=["↑" if g[1] > 0 else "↓" for g in normalized_gradients.cpu().numpy()],
+                        text=["↑" if g[1] > 0 else "↓" for g in normalized_gradients.detach().cpu().numpy()],
                         textposition="top center",
                         name="Gradient Direction"
                     )
@@ -868,7 +718,7 @@ class CLFNetworkLightning(pl.LightningModule):
                 
                 # Log to wandb
                 if isinstance(self.logger, pl.loggers.WandbLogger):
-                    wandb.log({"clf_gradient_field": fig})
+                    self.logger.experiment.log({"clf_gradient_field": fig}, step=self.global_step)
     
     def _log_lie_derivative_visualizations(self, states: torch.Tensor, dynamics_model: nn.Module) -> None:
         """
@@ -878,24 +728,27 @@ class CLFNetworkLightning(pl.LightningModule):
             states: Batch of states [batch_size, state_dim]
             dynamics_model: Model of the system dynamics
         """
-        with torch.no_grad():
+        # lie_derivatives → gradient() uses autograd.grad, which requires grad tracking.
+        # Use enable_grad() so this method stays safe even if called from within
+        # a torch.no_grad() scope (C1).
+        with torch.enable_grad():
             # Compute CLF values and Lie derivatives
             clf_values = self.compute_clf(states)
             L_f_V, L_g_V = self.lie_derivatives(states, dynamics_model)
-            
+
             # Compute state norms
             state_norms = torch.norm(states, dim=1).cpu().numpy()
-            
+
             # Create scatter plot of L_f_V values
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
                     x=state_norms,
-                    y=L_f_V.squeeze().cpu().numpy(),
+                    y=L_f_V.detach().squeeze().cpu().numpy(),
                     mode="markers",
                     marker=dict(
                         size=8,
-                        color=clf_values.squeeze().cpu().numpy(),
+                        color=clf_values.detach().squeeze().cpu().numpy(),
                         colorscale="Viridis",
                         showscale=True,
                         colorbar=dict(title="CLF Value")
@@ -903,34 +756,34 @@ class CLFNetworkLightning(pl.LightningModule):
                     name="L_f_V"
                 )
             )
-            
+
             # Add zero reference line
             fig.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
-            
+
             fig.update_layout(
                 title="Lie Derivative L_f_V vs. State Norm",
                 xaxis_title="State Norm ||x||",
                 yaxis_title="L_f_V",
                 showlegend=True
             )
-            
+
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"lie_derivative_lf": fig})
-            
+                self.logger.experiment.log({"lie_derivative_lf": fig}, step=self.global_step)
+
             # Create scatter plot of L_g_V values (first dimension if action is multi-dimensional)
             fig = go.Figure()
-            
+
             if L_g_V.shape[1] == 1:
                 # Single action dimension
                 fig.add_trace(
                     go.Scatter(
                         x=state_norms,
-                        y=L_g_V.squeeze().cpu().numpy(),
+                        y=L_g_V.detach().squeeze().cpu().numpy(),
                         mode="markers",
                         marker=dict(
                             size=8,
-                            color=clf_values.squeeze().cpu().numpy(),
+                            color=clf_values.detach().squeeze().cpu().numpy(),
                             colorscale="Viridis",
                             showscale=True,
                             colorbar=dict(title="CLF Value")
@@ -938,7 +791,7 @@ class CLFNetworkLightning(pl.LightningModule):
                         name="L_g_V"
                     )
                 )
-                
+
                 fig.update_layout(
                     title="Lie Derivative L_g_V vs. State Norm",
                     xaxis_title="State Norm ||x||",
@@ -947,7 +800,7 @@ class CLFNetworkLightning(pl.LightningModule):
                 )
             else:
                 # Multiple action dimensions, show norm of L_g_V
-                L_g_V_norm = torch.norm(L_g_V, dim=1).cpu().numpy()
+                L_g_V_norm = torch.norm(L_g_V, dim=1).detach().cpu().numpy()
                 fig.add_trace(
                     go.Scatter(
                         x=state_norms,
@@ -955,7 +808,7 @@ class CLFNetworkLightning(pl.LightningModule):
                         mode="markers",
                         marker=dict(
                             size=8,
-                            color=clf_values.squeeze().cpu().numpy(),
+                            color=clf_values.detach().squeeze().cpu().numpy(),
                             colorscale="Viridis",
                             showscale=True,
                             colorbar=dict(title="CLF Value")
@@ -963,42 +816,36 @@ class CLFNetworkLightning(pl.LightningModule):
                         name="||L_g_V||"
                     )
                 )
-                
+
                 fig.update_layout(
                     title="Norm of Lie Derivative L_g_V vs. State Norm",
                     xaxis_title="State Norm ||x||",
                     yaxis_title="||L_g_V||",
                     showlegend=True
                 )
-            
+
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"lie_derivative_lg": fig})
-            
-            # Create visualization of L_dot with stabilizing control u = -L_g_V if non-zero
-            # Check where L_g_V has significant magnitude
+                self.logger.experiment.log({"lie_derivative_lg": fig}, step=self.global_step)
+
+            # Stabilising control direction: u = -L_g_V / (||L_g_V|| + ε)  (R2)
             L_g_V_norm = torch.norm(L_g_V, dim=1, keepdim=True)
             epsilon = 1e-6
-            significant_control = L_g_V_norm > epsilon
-            
-            # For points with significant control authority, compute u = -L_g_V.T / (L_g_V_norm + epsilon)
-            u = torch.zeros_like(L_g_V)
-            u[significant_control.repeat(1, L_g_V.shape[1])] = -L_g_V[significant_control.repeat(1, L_g_V.shape[1])]
-            u = u / (L_g_V_norm + epsilon)
-            
+            u = -L_g_V / (L_g_V_norm + epsilon)
+
             # Compute Lie derivative with the computed control
             L_dot = L_f_V + torch.sum(L_g_V * u, dim=1, keepdim=True)
-            
+
             # Create scatter plot
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
                     x=state_norms,
-                    y=L_dot.squeeze().cpu().numpy(),
+                    y=L_dot.detach().squeeze().cpu().numpy(),
                     mode="markers",
                     marker=dict(
                         size=8,
-                        color=clf_values.squeeze().cpu().numpy(),
+                        color=clf_values.detach().squeeze().cpu().numpy(),
                         colorscale="Viridis",
                         showscale=True,
                         colorbar=dict(title="CLF Value")
@@ -1006,20 +853,20 @@ class CLFNetworkLightning(pl.LightningModule):
                     name="L_dot with stabilizing control"
                 )
             )
-            
+
             # Add zero reference line
             fig.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
-            
+
             fig.update_layout(
                 title="Total Lie Derivative with Stabilizing Control vs. State Norm",
                 xaxis_title="State Norm ||x||",
                 yaxis_title="L_dot",
                 showlegend=True
             )
-            
+
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"lie_derivative_total": fig})
+                self.logger.experiment.log({"lie_derivative_total": fig}, step=self.global_step)
     
     def on_train_start(self) -> None:
         """
@@ -1078,9 +925,8 @@ class CLFNetworkLightning(pl.LightningModule):
         # Compute on device to avoid unnecessary transfers
         device = next(self.parameters()).device
         
-        # Use the pendulum-specific equilibrium from pendulum_utils
-        from pendulum_utils import get_pendulum_equilibrium
-        equilibrium_state = get_pendulum_equilibrium().to(device)
+        # Use the equilibrium buffer registered in __init__ (L6 — no hard-coded import)
+        equilibrium_state = self.equilibrium
         
         # Compute CLF value at equilibrium
         with torch.no_grad():
@@ -1117,7 +963,9 @@ class CLFNetworkLightning(pl.LightningModule):
             )
             
             # Log to wandb
-            wandb.log({"clf_equilibrium_history": fig})
+            wandb_logger = self.logger if isinstance(self.logger, pl.loggers.WandbLogger) else None
+            if wandb_logger is not None:
+                wandb_logger.experiment.log({"clf_equilibrium_history": fig}, step=self.global_step)
     
     def on_train_epoch_end(self) -> None:
         """
@@ -1139,7 +987,7 @@ class CLFNetworkLightning(pl.LightningModule):
             
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"clf_value_contour": fig})
+                self.logger.experiment.log({"clf_value_contour": fig}, step=self.global_step)
         except Exception as e:
             print(f"Failed to generate CLF value contour: {e}")
         
@@ -1210,19 +1058,19 @@ class CLFNetworkLightning(pl.LightningModule):
             
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"admissible_control_set": fig})
-                
+                self.logger.experiment.log({"admissible_control_set": fig}, step=self.global_step)
+
                 # Also log statistics about the admissible control set
                 n_admissible = torch.sum(infimum_actions != float('inf')).item()
                 total_points = len(infimum_actions)
                 coverage = 100.0 * n_admissible / total_points
-                
+
                 # Log the percentage of states that have an admissible control
-                wandb.log({
+                self.logger.experiment.log({
                     "admissible_control_coverage": coverage,
                     "admissible_control_count": n_admissible,
-                })
-                
+                }, step=self.global_step)
+
                 # Log histogram of infimum action values (excluding points with no admissible control)
                 valid_actions = infimum_actions[infimum_actions != float('inf')].cpu().numpy()
                 if len(valid_actions) > 0:
@@ -1232,7 +1080,7 @@ class CLFNetworkLightning(pl.LightningModule):
                         xaxis_title="Control Value",
                         yaxis_title="Count"
                     )
-                    wandb.log({"admissible_control_histogram": fig})
+                    self.logger.experiment.log({"admissible_control_histogram": fig}, step=self.global_step)
                 
         except Exception as e:
             print(f"Failed to generate admissible control visualization: {e}")

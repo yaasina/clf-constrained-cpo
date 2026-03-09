@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from typing import Tuple, List, Dict, Any, Optional, Union
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+from torch.utils.data import Dataset, DataLoader
 
 
 class DynamicsDataset(Dataset):
@@ -166,26 +166,23 @@ class DynamicsDataset(Dataset):
 
 class CLFDataset(Dataset):
     """
-    Dataset for CLF learning containing states and optionally a dynamics model for Lie derivative computation.
+    Dataset for CLF learning containing states.
     """
-    
+
     def __init__(
         self,
         states: torch.Tensor,
-        dynamics_model: Optional[torch.nn.Module] = None,
         normalize: bool = False
     ) -> None:
         """
-        Initialize the dataset with states and optionally a dynamics model.
-        
+        Initialize the dataset with states.
+
         Args:
             states: Tensor of states [n_samples, state_dim]
-            dynamics_model: Optional dynamics model for Lie derivative computation
             normalize: Whether to normalize the data
         """
         self.states = states
-        self.dynamics_model = dynamics_model
-        
+
         # Compute normalization statistics if needed
         if normalize:
             self.normalize_data()
@@ -351,37 +348,76 @@ class DynamicsDataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """
         Setup the datasets for training, validation, and testing.
-        
+        Normalization statistics are computed from the training split only to
+        prevent val/test data leaking into the normalisation (R7).
+
         Args:
             stage: Optional stage to setup ('fit', 'validate', 'test')
         """
         # Validate that we have the required data
         if self.states is None or self.actions is None or self.next_states is None:
             raise ValueError("States, actions, and next_states must be provided.")
-        
-        # Create full dataset
-        full_dataset = DynamicsDataset(
-            states=self.states,
-            actions=self.actions,
-            next_states=self.next_states,
-            state_derivatives=self.state_derivatives,
-            normalize=self.normalize
-        )
-        
-        # Calculate split sizes
-        n_samples = len(full_dataset)
+
+        n_samples = len(self.states)
         n_train = int(self.train_ratio * n_samples)
         n_val = int(self.val_ratio * n_samples)
         n_test = n_samples - n_train - n_val
-        
-        # Create splits
+
+        # Reproducible random split via index permutation
         generator = torch.Generator().manual_seed(self.random_seed)
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-            full_dataset, [n_train, n_val, n_test], generator=generator
-        )
-        
-        # Store normalization stats for potential later use
-        self.normalization_stats = full_dataset.get_normalization_stats()
+        perm = torch.randperm(n_samples, generator=generator)
+        train_idx = perm[:n_train]
+        val_idx = perm[n_train:n_train + n_val]
+        test_idx = perm[n_train + n_val:]
+
+        # Slice raw tensors per split
+        train_s = self.states[train_idx]
+        train_a = self.actions[train_idx]
+        train_ns = self.next_states[train_idx]
+        val_s = self.states[val_idx]
+        val_a = self.actions[val_idx]
+        val_ns = self.next_states[val_idx]
+        test_s = self.states[test_idx]
+        test_a = self.actions[test_idx]
+        test_ns = self.next_states[test_idx]
+
+        # Optional normalisation — stats from training data only
+        if self.normalize:
+            s_mean = train_s.mean(dim=0, keepdim=True)
+            s_std = train_s.std(dim=0, keepdim=True)
+            a_mean = train_a.mean(dim=0, keepdim=True)
+            a_std = train_a.std(dim=0, keepdim=True)
+            s_std[s_std < 1e-8] = 1.0
+            a_std[a_std < 1e-8] = 1.0
+
+            self.normalization_stats = {
+                "state_mean": s_mean, "state_std": s_std,
+                "action_mean": a_mean, "action_std": a_std
+            }
+
+            def norm_s(x): return (x - s_mean) / s_std
+            def norm_a(x): return (x - a_mean) / a_std
+
+            train_s, train_a, train_ns = norm_s(train_s), norm_a(train_a), norm_s(train_ns)
+            val_s, val_a, val_ns = norm_s(val_s), norm_a(val_a), norm_s(val_ns)
+            test_s, test_a, test_ns = norm_s(test_s), norm_a(test_a), norm_s(test_ns)
+        else:
+            self.normalization_stats = {
+                "state_mean": None, "state_std": None,
+                "action_mean": None, "action_std": None
+            }
+
+        # Build three separate Dataset objects (data already normalized, skip internal norm)
+        sd = self.state_derivatives
+        self.train_dataset = DynamicsDataset(train_s, train_a, train_ns,
+                                             state_derivatives=sd[train_idx] if sd is not None else None,
+                                             normalize=False)
+        self.val_dataset = DynamicsDataset(val_s, val_a, val_ns,
+                                           state_derivatives=sd[val_idx] if sd is not None else None,
+                                           normalize=False)
+        self.test_dataset = DynamicsDataset(test_s, test_a, test_ns,
+                                            state_derivatives=sd[test_idx] if sd is not None else None,
+                                            normalize=False)
     
     def train_dataloader(self) -> DataLoader:
         """Return the training dataloader."""
@@ -434,11 +470,10 @@ class CLFDataModule(pl.LightningDataModule):
     PyTorch Lightning data module for CLF learning.
     Handles data loading, splitting, normalization, and batch preparation.
     """
-    
+
     def __init__(
         self,
         states: torch.Tensor = None,
-        dynamics_model: Optional[torch.nn.Module] = None,
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
@@ -451,24 +486,22 @@ class CLFDataModule(pl.LightningDataModule):
     ) -> None:
         """
         Initialize the data module.
-        
+
         Args:
             states: Tensor of states [n_samples, state_dim]
-            dynamics_model: Optional dynamics model for Lie derivative computation
             train_ratio: Ratio of data to use for training
             val_ratio: Ratio of data to use for validation
             test_ratio: Ratio of data to use for testing
             batch_size: Batch size for data loaders
             num_workers: Number of worker processes for data loading
-            normalize: Whether to normalize the data
+            normalize: Whether to normalize the data (stats derived from train split only)
             random_seed: Random seed for reproducibility
             data_path: Optional path to load data from (instead of using provided tensors)
             persistent_workers: Whether to keep worker processes alive between batches
         """
         super().__init__()
-        
+
         self.states = states
-        self.dynamics_model = dynamics_model
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
@@ -478,12 +511,12 @@ class CLFDataModule(pl.LightningDataModule):
         self.random_seed = random_seed
         self.data_path = data_path
         self.persistent_workers = persistent_workers
-        
+
         # Placeholder for datasets
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
-        
+
         # Ensure ratios sum to 1
         total_ratio = train_ratio + val_ratio + test_ratio
         if abs(total_ratio - 1.0) > 1e-6:
@@ -511,35 +544,49 @@ class CLFDataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """
         Setup the datasets for training, validation, and testing.
-        
+        Normalization statistics are computed from the training split only (R7).
+
         Args:
             stage: Optional stage to setup ('fit', 'validate', 'test')
         """
         # Validate that we have the required data
         if self.states is None:
             raise ValueError("States must be provided.")
-        
-        # Create full dataset
-        full_dataset = CLFDataset(
-            states=self.states,
-            dynamics_model=self.dynamics_model,
-            normalize=self.normalize
-        )
-        
-        # Calculate split sizes
-        n_samples = len(full_dataset)
+
+        n_samples = len(self.states)
         n_train = int(self.train_ratio * n_samples)
         n_val = int(self.val_ratio * n_samples)
         n_test = n_samples - n_train - n_val
-        
-        # Create splits
+
+        # Reproducible random split via index permutation
         generator = torch.Generator().manual_seed(self.random_seed)
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-            full_dataset, [n_train, n_val, n_test], generator=generator
-        )
-        
-        # Store normalization stats for potential later use
-        self.normalization_stats = full_dataset.get_normalization_stats()
+        perm = torch.randperm(n_samples, generator=generator)
+        train_idx = perm[:n_train]
+        val_idx = perm[n_train:n_train + n_val]
+        test_idx = perm[n_train + n_val:]
+
+        train_s = self.states[train_idx]
+        val_s = self.states[val_idx]
+        test_s = self.states[test_idx]
+
+        # Optional normalisation — stats from training data only
+        if self.normalize:
+            s_mean = train_s.mean(dim=0, keepdim=True)
+            s_std = train_s.std(dim=0, keepdim=True)
+            s_std[s_std < 1e-8] = 1.0
+
+            self.normalization_stats = {"state_mean": s_mean, "state_std": s_std}
+
+            train_s = (train_s - s_mean) / s_std
+            val_s = (val_s - s_mean) / s_std
+            test_s = (test_s - s_mean) / s_std
+        else:
+            self.normalization_stats = {"state_mean": None, "state_std": None}
+
+        # Build three separate Dataset objects
+        self.train_dataset = CLFDataset(train_s, normalize=False)
+        self.val_dataset = CLFDataset(val_s, normalize=False)
+        self.test_dataset = CLFDataset(test_s, normalize=False)
     
     def train_dataloader(self) -> DataLoader:
         """Return the training dataloader."""

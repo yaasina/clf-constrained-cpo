@@ -83,3 +83,6 @@ data/*.h5
 # Allow keeping empty directories with .gitkeep
 !.gitkeep
 0.1.5
+
+# Notes and drafs
+notes/

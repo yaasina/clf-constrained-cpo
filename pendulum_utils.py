@@ -6,60 +6,70 @@ from typing import Tuple, List, Dict, Any, Optional
 def get_pendulum_equilibrium() -> torch.Tensor:
     """
     Get the equilibrium state for the pendulum environment.
-    
+
+    The state convention used throughout this project is [sin(θ), cos(θ), θ̇],
+    matching pendulum_dynamics.py. The upright equilibrium is θ=0, so
+    sin(0)=0, cos(0)=1, θ̇=0 → [0, 1, 0].
+
     Returns:
-        Tensor representing the equilibrium state [1, 0, 0]
+        Tensor representing the equilibrium state [0, 1, 0]
     """
-    return torch.tensor([1.0, 0.0, 0.0])
+    return torch.tensor([0.0, 1.0, 0.0])
 
 def state_to_angle(state: torch.Tensor) -> torch.Tensor:
     """
-    Convert pendulum state [cos(θ), sin(θ), θ̇] to [θ, θ̇].
-    
+    Convert pendulum state [sin(θ), cos(θ), θ̇] to [θ, θ̇].
+
+    State convention: index 0 = sin(θ), index 1 = cos(θ), index 2 = θ̇.
+    This matches the ordering used in pendulum_dynamics.py.
+
     Args:
         state: Pendulum state tensor of shape [..., 3]
-        
+
     Returns:
         Transformed state tensor of shape [..., 2] with [θ, θ̇]
     """
-    cos_theta = state[..., 0]
-    sin_theta = state[..., 1]
+    sin_theta = state[..., 0]
+    cos_theta = state[..., 1]
     theta_dot = state[..., 2]
-    
-    # Convert cos and sin to angle (in radians)
+
+    # Convert sin and cos to angle (in radians)
     # Use atan2 to get the correct quadrant
     theta = torch.atan2(sin_theta, cos_theta)
-    
+
     # Reshape to match original dimensions but with 2 features
     original_shape = list(state.shape)
     original_shape[-1] = 2
-    
+
     # Stack theta and theta_dot
     return torch.stack([theta, theta_dot], dim=-1).reshape(original_shape)
 
 def angle_to_state(angle_state: torch.Tensor) -> torch.Tensor:
     """
-    Convert [θ, θ̇] to pendulum state [cos(θ), sin(θ), θ̇].
-    
+    Convert [θ, θ̇] to pendulum state [sin(θ), cos(θ), θ̇].
+
+    State convention: index 0 = sin(θ), index 1 = cos(θ), index 2 = θ̇.
+    This matches the ordering used in pendulum_dynamics.py.
+
     Args:
         angle_state: Tensor of shape [..., 2] with [θ, θ̇]
-        
+
     Returns:
         Pendulum state tensor of shape [..., 3]
     """
     theta = angle_state[..., 0]
     theta_dot = angle_state[..., 1]
-    
-    # Convert angle to cos and sin
-    cos_theta = torch.cos(theta)
+
+    # Convert angle to sin and cos
     sin_theta = torch.sin(theta)
-    
+    cos_theta = torch.cos(theta)
+
     # Reshape to match original dimensions but with 3 features
     original_shape = list(angle_state.shape)
     original_shape[-1] = 3
-    
-    # Stack cos, sin, and theta_dot
-    return torch.stack([cos_theta, sin_theta, theta_dot], dim=-1).reshape(original_shape)
+
+    # Stack sin, cos, and theta_dot (matching pendulum_dynamics.py convention)
+    return torch.stack([sin_theta, cos_theta, theta_dot], dim=-1).reshape(original_shape)
 
 def create_pendulum_grid(
     resolution: int = 50,

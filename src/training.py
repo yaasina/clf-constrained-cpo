@@ -47,14 +47,11 @@ def get_space_dimension(space):
 def set_seed(seed: int) -> None:
     """
     Set random seed for reproducibility.
-    
+
     Args:
         seed: Random seed
     """
-    pl.seed_everything(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+    pl.seed_everything(seed)  # covers torch, numpy, and python random
 
 
 def setup_callbacks(config: DictConfig) -> List[pl.Callback]:
@@ -184,23 +181,20 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
             else:
                 raise ValueError("Neither environment nor data path specified for training")
         
-        # Create data module
-        data_module_params = {
-            "_target_": DynamicsDataModule,
-            "batch_size": batch_size,
-            "num_workers": config.experiment.training.get("num_workers", 4),
-            "normalize": config.experiment.dynamics.get("normalize_data", True),
-            "random_seed": config.seed,
-            "states": states,
-            "actions": actions,
-            "next_states": next_states,
-            "persistent_workers": config.experiment.data.get("persistent_workers", False),
-            "train_ratio": config.experiment.data.get("train_ratio", 0.8),
-            "val_ratio": config.experiment.data.get("val_ratio", 0.1),
-            "test_ratio": config.experiment.data.get("test_ratio", 0.1),
-        }
-        
-        data_module = hydra.utils.instantiate(data_module_params, _recursive_=False)
+        # Create data module (direct instantiation - avoids _target_ string issues) (L4)
+        data_module = DynamicsDataModule(
+            batch_size=batch_size,
+            num_workers=config.experiment.training.get("num_workers", 4),
+            normalize=config.experiment.dynamics.get("normalize_data", True),
+            random_seed=config.seed,
+            states=states,
+            actions=actions,
+            next_states=next_states,
+            persistent_workers=config.experiment.data.get("persistent_workers", False),
+            train_ratio=config.experiment.data.get("train_ratio", 0.8),
+            val_ratio=config.experiment.data.get("val_ratio", 0.1),
+            test_ratio=config.experiment.data.get("test_ratio", 0.1),
+        )
         data_module.prepare_data()
         data_module.setup()
         
@@ -258,11 +252,7 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
         
         # Update total epochs trained
         total_epochs_trained += epochs_per_trajectory
-        
-        # Update the model's trajectory counter if it supports it
-        if hasattr(model, 'trajectory_counter'):
-            model.trajectory_counter = traj_idx + 1
-            
+
         # Log trajectory completion
         if isinstance(logger, pl.loggers.WandbLogger):
             logger.experiment.log({
@@ -353,35 +343,20 @@ def train_clf_model(
         # Clean up environment
         env.close()
     
-    # Extract only the parameters that CLFDataModule accepts
-    data_module_params = {
-        "_target_": CLFDataModule,
-        "batch_size": config.experiment.training.get("batch_size", config.training.batch_size),
-        "num_workers": config.experiment.training.get("num_workers", 4),
-        "normalize": config.experiment.dynamics.get("normalize_data", True),
-        "random_seed": config.seed,
-        "dynamics_model": dynamics_model,
-        "persistent_workers": config.experiment.data.get("persistent_workers", False),
-        "states": states  # Add the collected states
-    }
-    
-    # If data paths are specified, add them
-    if hasattr(config.experiment.data, "data_path") and config.experiment.data.data_path:
-        data_module_params["data_path"] = config.experiment.data.data_path
-        
-    # Add train/val/test ratios if specified
-    if hasattr(config.experiment.data, "train_ratio"):
-        data_module_params["train_ratio"] = config.experiment.data.train_ratio
-    if hasattr(config.experiment.data, "val_ratio"):
-        data_module_params["val_ratio"] = config.experiment.data.val_ratio
-    if hasattr(config.experiment.data, "test_ratio"):
-        data_module_params["test_ratio"] = config.experiment.data.test_ratio
-    
-    # Load data
-    data_module = hydra.utils.instantiate(
-        data_module_params,
-        _recursive_=False,
+    # Direct instantiation — avoids _target_ string issues (L4)
+    data_module = CLFDataModule(
+        states=states,
+        batch_size=config.experiment.training.get("batch_size", config.training.batch_size),
+        num_workers=config.experiment.training.get("num_workers", 4),
+        normalize=config.experiment.dynamics.get("normalize_data", True),
+        random_seed=config.seed,
+        persistent_workers=config.experiment.data.get("persistent_workers", False),
+        train_ratio=config.experiment.data.get("train_ratio", 0.8),
+        val_ratio=config.experiment.data.get("val_ratio", 0.1),
+        test_ratio=config.experiment.data.get("test_ratio", 0.1),
     )
+    if hasattr(config.experiment.data, "data_path") and config.experiment.data.data_path:
+        data_module.data_path = config.experiment.data.data_path
     
     # Setup the data module to access the dimensions
     data_module.prepare_data()
@@ -406,7 +381,22 @@ def train_clf_model(
     
     # Initialize model with dynamic dimensions
     model = hydra.utils.instantiate(model_config)
-    
+
+    # Attach dynamics model so training_step can access it without putting it in batches (C2)
+    model.dynamics_model = dynamics_model
+
+    # Attach QP solver so training_step can use the full self-supervised CLF loss (C5)
+    if action_dim is not None:
+        model.qp_solver = CLFQPSolverLightning(action_dim=action_dim)
+
+    # Set pendulum equilibrium on the model buffer so CLF loss targets the right point (L6)
+    if hasattr(model, 'equilibrium'):
+        try:
+            from pendulum_utils import get_pendulum_equilibrium
+            model.equilibrium.copy_(get_pendulum_equilibrium())
+        except Exception:
+            pass
+
     # Log the inferred dimensions
     logger.experiment.config.update({
         "state_dim": state_dim
@@ -739,7 +729,6 @@ def main(config: DictConfig) -> Dict[str, Any]:
             clf_data_module = CLFDataModule(
                 states=states,
                 batch_size=batch_size,
-                dynamics_model=dynamics_model,  # Pass the updated dynamics model
                 num_workers=config.experiment.training.get("num_workers", 4),
                 normalize=config.experiment.dynamics.get("normalize_data", True),
                 random_seed=config.seed,
@@ -765,7 +754,21 @@ def main(config: DictConfig) -> Dict[str, Any]:
                 
                 # Initialize CLF model
                 clf_model = hydra.utils.instantiate(clf_model_config)
-                
+
+                # Attach dynamics model so training_step can access it (C2)
+                clf_model.dynamics_model = dynamics_model
+
+                # Attach QP solver for full self-supervised CLF loss (C5)
+                clf_model.qp_solver = CLFQPSolverLightning(action_dim=action_dim)
+
+                # Set equilibrium on model buffer (L6)
+                if hasattr(clf_model, 'equilibrium'):
+                    try:
+                        from pendulum_utils import get_pendulum_equilibrium
+                        clf_model.equilibrium.copy_(get_pendulum_equilibrium())
+                    except Exception:
+                        pass
+
                 # Log CLF model config
                 clf_logger.experiment.config.update(clf_config_dict)
             

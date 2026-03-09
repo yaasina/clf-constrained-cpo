@@ -9,7 +9,6 @@ from typing import Tuple, List, Dict, Any, Optional, Union, Callable
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 import pytorch_lightning as pl
-import wandb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -198,29 +197,35 @@ class CLFQPSolverLightning(pl.LightningModule):
         return torch.zeros(self.action_dim, device=x.device), torch.tensor([float('inf')], device=x.device), True
 
     def solve_batch(
-        self, 
-        dataset: torch.Tensor, 
+        self,
+        dataset: torch.Tensor,
         clf_net: nn.Module,
-        dynamics_model: nn.Module, 
+        dynamics_model: nn.Module,
         batch_size: int = 32,
         log_results: bool = False
     ) -> Dict[str, Any]:
         """
-        Solve the QP problem for a batch of states, processing in smaller batches for efficiency.
-        
+        Evaluate the QP for every state in *dataset*.
+
+        CLF values and Lie derivatives are computed in mini-batches of
+        *batch_size* for memory efficiency. However, the QP itself is solved
+        independently (and sequentially) for each state point — there is no
+        batched QP solver. Full batched solving via CvxpyLayer is left as a
+        future optimisation (R4).
+
         Args:
             dataset: Dataset of state points with shape (n_samples, state_dim)
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
-            batch_size: Size of mini-batches for processing
-            log_results: Whether to log visualization results to Weights & Biases
-            
+            batch_size: Mini-batch size for CLF / Lie-derivative evaluation
+            log_results: Whether to log visualisation results to Weights & Biases
+
         Returns:
             Dictionary containing:
                 u_values: Tensor of optimal control inputs
-                r_values: Tensor of relaxation variable values
-                failed_states: List of state points where optimization failed
-                success_rate: Percentage of successful optimizations
+                r_values: Tensor of relaxation variable values (inf for failed solves)
+                failed_states: List of state points where optimisation failed
+                success_rate: Percentage of successful optimisations
         """
         self.reset_values()
         device = dataset.device
@@ -393,18 +398,16 @@ class CLFQPSolverLightning(pl.LightningModule):
                 U1, U2 = torch.meshgrid(u1_samples, u2_samples, indexing='ij')
                 control_samples = torch.stack([U1.flatten(), U2.flatten()], dim=1)
                 
-                # Compute Lie derivative for each control
-                lie_derivatives = []
-                for u in control_samples:
-                    # Make sure L_g_V shape is compatible with control vector
-                    if L_g_V.shape[1] != self.action_dim:
-                        L_g_V_reshaped = L_g_V.reshape(-1, self.action_dim)
-                    else:
-                        L_g_V_reshaped = L_g_V
-                    
-                    lie_derivatives.append(L_f_V + torch.sum(L_g_V_reshaped * u))
-                
-                lie_derivatives = torch.tensor(lie_derivatives, device=state.device)
+                # Vectorised Lie derivative for all control samples (P2)
+                # L_g_V_reshaped: [1, action_dim], control_samples: [N, action_dim]
+                if L_g_V.shape[1] != self.action_dim:
+                    L_g_V_reshaped = L_g_V.reshape(1, self.action_dim)
+                else:
+                    L_g_V_reshaped = L_g_V  # already [1, action_dim]
+
+                lie_derivatives = (
+                    L_f_V.squeeze() + (control_samples * L_g_V_reshaped).sum(dim=-1)
+                )  # shape [N]
                 
                 # Find admissible controls
                 admissible_mask = lie_derivatives <= 0
@@ -454,7 +457,10 @@ class CLFQPSolverLightning(pl.LightningModule):
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
         """
-        with torch.no_grad():
+        # autograd.grad is used inside clf_net.lie_derivatives → gradient().
+        # Use enable_grad() so this method stays correct even if called from
+        # a torch.no_grad() context (C1).
+        with torch.enable_grad():
             # Create scatter plot of control values vs. state norm
             if self.action_dim == 1:
                 # 1D control, can visualize directly
@@ -508,8 +514,8 @@ class CLFQPSolverLightning(pl.LightningModule):
                 
                 # Log to wandb
                 if isinstance(self.logger, pl.loggers.WandbLogger):
-                    wandb.log({"qp_control_vs_norm": fig})
-                    
+                    self.logger.experiment.log({"qp_control_vs_norm": fig}, step=self.global_step)
+
                 # Create histogram of relaxation values
                 fig = go.Figure()
                 fig.add_trace(
@@ -528,12 +534,12 @@ class CLFQPSolverLightning(pl.LightningModule):
                 
                 # Log to wandb
                 if isinstance(self.logger, pl.loggers.WandbLogger):
-                    wandb.log({"qp_relaxation_histogram": fig})
-            
+                    self.logger.experiment.log({"qp_relaxation_histogram": fig}, step=self.global_step)
+
             # Create visualization of resulting Lie derivatives with the computed control
-            # Sample a subset of states for visualization
+            # Sample a subset of states for visualization (P3: use seeded torch.randperm)
             max_samples = min(100, len(states))
-            sample_indices = np.random.choice(len(states), max_samples, replace=False)
+            sample_indices = torch.randperm(len(states), device=states.device)[:max_samples]
             
             sampled_states = states[sample_indices]
             sampled_controls = u_values[sample_indices]
@@ -586,8 +592,8 @@ class CLFQPSolverLightning(pl.LightningModule):
             
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"lie_derivative_with_qp_control": fig})
-    
+                self.logger.experiment.log({"lie_derivative_with_qp_control": fig}, step=self.global_step)
+
     def _log_admissible_controls_1d_wandb(
         self,
         state: torch.Tensor,
@@ -608,33 +614,34 @@ class CLFQPSolverLightning(pl.LightningModule):
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
         """
-        with torch.no_grad():
+        # autograd.grad is used inside solve_point → clf_net.lie_derivatives → gradient().
+        # Use enable_grad() so this method stays correct even if called from
+        # a torch.no_grad() context (C1).
+        with torch.enable_grad():
             # Create figure
             fig = go.Figure()
-            
+
             # Plot Lie derivative for each control sample
             fig.add_trace(
                 go.Scatter(
                     x=control_samples.squeeze().cpu().numpy(),
-                    y=lie_derivatives.squeeze().cpu().numpy(),
+                    y=lie_derivatives.squeeze().detach().cpu().numpy(),
                     mode="lines",
                     line=dict(color="blue", width=2),
                     name="Lie Derivative"
                 )
             )
-            
+
             # Highlight admissible controls
             if len(admissible_controls) > 0:
-                # Create admissible region by adding a colored area
-                # First, determine the y-values corresponding to the admissible controls
-                admissible_indices = []
-                for u in admissible_controls:
-                    idx = torch.argmin(torch.abs(control_samples - u)).item()
-                    admissible_indices.append(idx)
-                
+                # P1: use the admissible mask directly instead of an O(N²) argmin loop.
+                # admissible_controls = control_samples[admissible_mask.squeeze()], so the
+                # corresponding lie_derivative values are simply the masked slice.
+                admissible_mask = lie_derivatives.squeeze() <= 0
+
                 admissible_x = admissible_controls.squeeze().cpu().numpy()
-                admissible_y = lie_derivatives.squeeze()[admissible_indices].cpu().numpy()
-                
+                admissible_y = lie_derivatives.squeeze().detach()[admissible_mask].cpu().numpy()
+
                 # Add a colored area for admissible region
                 fig.add_trace(
                     go.Scatter(
@@ -649,18 +656,18 @@ class CLFQPSolverLightning(pl.LightningModule):
                         name="Admissible Controls"
                     )
                 )
-                
+
                 # Compute the optimal control from QP
                 u_qp, _, _ = self.solve_point(state, clf_net, dynamics_model)
-                
+
                 # Find the closest control sample to the QP solution
                 u_qp_idx = torch.argmin(torch.abs(control_samples - u_qp)).item()
-                
+
                 # Add QP solution to the plot
                 fig.add_trace(
                     go.Scatter(
                         x=[u_qp.item()],
-                        y=[lie_derivatives.squeeze()[u_qp_idx].item()],
+                        y=[lie_derivatives.squeeze().detach()[u_qp_idx].item()],
                         mode="markers",
                         marker=dict(
                             size=12,
@@ -670,10 +677,10 @@ class CLFQPSolverLightning(pl.LightningModule):
                         name="QP Solution"
                     )
                 )
-            
+
             # Add zero reference line
             fig.add_hline(y=0, line=dict(color="red", dash="dash"), name="Zero")
-            
+
             # Update layout
             fig.update_layout(
                 title=f"Lie Derivative vs. Control (State Norm: {torch.norm(state).item():.4f})",
@@ -681,10 +688,10 @@ class CLFQPSolverLightning(pl.LightningModule):
                 yaxis_title="Lie Derivative",
                 showlegend=True
             )
-            
+
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"admissible_controls_1d": fig})
+                self.logger.experiment.log({"admissible_controls_1d": fig}, step=self.global_step)
     
     def _log_admissible_controls_2d_wandb(
         self,
@@ -712,10 +719,13 @@ class CLFQPSolverLightning(pl.LightningModule):
             clf_net: Control Lyapunov Function neural network
             dynamics_model: System dynamics model
         """
-        with torch.no_grad():
+        # autograd.grad is used inside solve_point → clf_net.lie_derivatives → gradient().
+        # Use enable_grad() so this method stays correct even if called from
+        # a torch.no_grad() context (C1).
+        with torch.enable_grad():
             # Create contour plot of Lie derivative values
             grid_size = u1_samples.shape[0]
-            lie_grid = lie_derivatives.reshape(grid_size, grid_size).cpu().numpy()
+            lie_grid = lie_derivatives.detach().reshape(grid_size, grid_size).cpu().numpy()
             
             # Create figure with subplots
             fig = make_subplots(
@@ -835,4 +845,4 @@ class CLFQPSolverLightning(pl.LightningModule):
             
             # Log to wandb
             if isinstance(self.logger, pl.loggers.WandbLogger):
-                wandb.log({"admissible_controls_2d": fig})
+                self.logger.experiment.log({"admissible_controls_2d": fig}, step=self.global_step)
