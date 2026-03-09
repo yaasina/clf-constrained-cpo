@@ -67,13 +67,12 @@ class ControlAffineNetworkLightning(pl.LightningModule):
         # g(x) - control matrix
         self.g_layer = nn.Linear(hidden_dim, state_dim * action_dim)
         
-    def forward(self, state: torch.Tensor, enable_dropout: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass to compute f(x) and g(x).
         
         Args:
             state: Batch of state vectors [batch_size, state_dim]
-            enable_dropout: Whether to enable dropout during inference for MC dropout
             
         Returns:
             Tuple containing:
@@ -81,13 +80,6 @@ class ControlAffineNetworkLightning(pl.LightningModule):
                 g(x): Control matrix [batch_size, state_dim, action_dim]
         """
         batch_size = state.shape[0]
-        
-        # Save current training state
-        training = self.training
-        
-        # Enable dropout during inference if MC dropout is enabled
-        if enable_dropout and not training:
-            self.train()
         
         # Compute shared features
         features = self.shared_layers(state)
@@ -99,17 +91,12 @@ class ControlAffineNetworkLightning(pl.LightningModule):
         g_x_flat = self.g_layer(features)
         g_x = g_x_flat.view(batch_size, self.state_dim, self.action_dim)
         
-        # Restore original training state
-        if enable_dropout and not training:
-            self.eval()
-        
         return f_x, g_x
     
     def predict_state_derivative(
         self, 
         state: torch.Tensor, 
-        action: torch.Tensor,
-        enable_dropout: bool = False
+        action: torch.Tensor
     ) -> torch.Tensor:
         """
         Predict the state derivative using the control-affine model.
@@ -117,12 +104,11 @@ class ControlAffineNetworkLightning(pl.LightningModule):
         Args:
             state: Batch of state vectors [batch_size, state_dim]
             action: Batch of action vectors [batch_size, action_dim]
-            enable_dropout: Whether to enable dropout during inference for MC dropout
             
         Returns:
             Predicted state derivative [batch_size, state_dim]
         """
-        f_x, g_x = self.forward(state, enable_dropout=enable_dropout)
+        f_x, g_x = self.forward(state)
         
         # Compute x_dot = f(x) + g(x)u
         # g_x shape: [batch_size, state_dim, action_dim]
@@ -137,8 +123,7 @@ class ControlAffineNetworkLightning(pl.LightningModule):
         self, 
         state: torch.Tensor, 
         action: torch.Tensor, 
-        dt: Optional[float] = None,
-        enable_dropout: bool = False
+        dt: Optional[float] = None
     ) -> torch.Tensor:
         """
         Predict the next state using Euler integration.
@@ -147,7 +132,6 @@ class ControlAffineNetworkLightning(pl.LightningModule):
             state: Current state [batch_size, state_dim]
             action: Action [batch_size, action_dim]
             dt: Time step for Euler integration (uses self.dt if None)
-            enable_dropout: Whether to enable dropout during inference for MC dropout
             
         Returns:
             Predicted next state [batch_size, state_dim]
@@ -155,7 +139,7 @@ class ControlAffineNetworkLightning(pl.LightningModule):
         if dt is None:
             dt = self.dt
             
-        state_derivative = self.predict_state_derivative(state, action, enable_dropout=enable_dropout)
+        state_derivative = self.predict_state_derivative(state, action)
         next_state = state + dt * state_derivative
         return next_state
     
@@ -310,8 +294,6 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         hidden_dim: int = 64,
         ensemble_size: int = 5,
         dropout_rate: float = 0.1,
-        mc_dropout_samples: int = 20,
-        mc_dropout_enabled: bool = False,
         learning_rate: float = 1e-3,
         dt: float = 0.05,
         # Variance normalization parameters
@@ -329,8 +311,6 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             hidden_dim: Dimension of hidden layers
             ensemble_size: Number of models in the ensemble
             dropout_rate: Dropout probability for regularization
-            mc_dropout_samples: Number of samples for MC dropout uncertainty estimation
-            mc_dropout_enabled: Whether to use MC dropout during inference (default: False)
             learning_rate: Learning rate for optimizer
             dt: Time step for Euler integration
             static_norm_k: Scaling parameter for static normalization: 1-exp(-k*var)
@@ -346,8 +326,6 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.dropout_rate = dropout_rate
-        self.mc_dropout_samples = mc_dropout_samples
-        self.mc_dropout_enabled = mc_dropout_enabled
         self.learning_rate = learning_rate
         self.dt = dt
         
@@ -359,7 +337,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         self.variance_buffer_size = variance_buffer_size
         
         # Buffer to store variance history for median calculation
-        self.variance_history = []
+        self.variance_history: List[float] = []
         
         # Trajectory counter to know when to update variance norms
         self.trajectory_counter = 0
@@ -379,23 +357,22 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         
     def forward(
         self, 
-        state: torch.Tensor,
-        enable_dropout: bool = False
+        state: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through all models in the ensemble.
+        Returns the mean predictions across all ensemble members.
         
         Args:
             state: Batch of state vectors [batch_size, state_dim]
-            enable_dropout: Whether to enable dropout during inference for MC dropout
             
         Returns:
             Tuple containing:
-                f(x): Mean autonomous dynamics [batch_size, state_dim]
-                g(x): Mean control matrix [batch_size, state_dim, action_dim]
+                f(x): Mean autonomous dynamics across ensemble [batch_size, state_dim]
+                g(x): Mean control matrix across ensemble [batch_size, state_dim, action_dim]
         """
         # Get predictions from all models
-        outputs = [model(state, enable_dropout=enable_dropout) for model in self.models]
+        outputs = [model(state) for model in self.models]
         
         # Separate f(x) and g(x) components
         f_outputs = [output[0] for output in outputs]
@@ -411,8 +388,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         self, 
         state: torch.Tensor, 
         action: torch.Tensor,
-        return_individual: bool = False,
-        enable_dropout: bool = False
+        return_individual: bool = False
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Predict state derivatives from all models.
@@ -421,7 +397,6 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             state: Batch of state vectors [batch_size, state_dim]
             action: Batch of action vectors [batch_size, action_dim]
             return_individual: If True, return predictions from each model
-            enable_dropout: Whether to enable dropout during inference for MC dropout
             
         Returns:
             If return_individual is True:
@@ -430,7 +405,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
                 Mean prediction across ensemble [batch_size, state_dim]
         """
         predictions = [
-            model.predict_state_derivative(state, action, enable_dropout=enable_dropout) 
+            model.predict_state_derivative(state, action) 
             for model in self.models
         ]
         
@@ -445,8 +420,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         state: torch.Tensor, 
         action: torch.Tensor, 
         dt: Optional[float] = None,
-        return_individual: bool = False,
-        enable_dropout: bool = False
+        return_individual: bool = False
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Predict next states from all models.
@@ -456,7 +430,6 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             action: Action [batch_size, action_dim]
             dt: Time step for Euler integration (uses self.dt if None)
             return_individual: If True, return predictions from each model
-            enable_dropout: Whether to enable dropout during inference for MC dropout
             
         Returns:
             If return_individual is True:
@@ -468,7 +441,7 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             dt = self.dt
             
         predictions = [
-            model.predict_next_state(state, action, dt, enable_dropout=enable_dropout) 
+            model.predict_next_state(state, action, dt) 
             for model in self.models
         ]
         
@@ -481,48 +454,28 @@ class DynamicsEnsembleLightning(pl.LightningModule):
     def compute_uncertainty(
         self, 
         state: torch.Tensor, 
-        action: torch.Tensor,
-        use_mc_dropout: bool = True
+        action: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute epistemic uncertainty as the variance of predictions across the ensemble.
-        Optionally uses Monte Carlo dropout for additional uncertainty estimation.
         
         Args:
             state: Batch of state vectors [batch_size, state_dim]
             action: Batch of action vectors [batch_size, action_dim]
-            use_mc_dropout: If True, use MC dropout for uncertainty estimation
             
         Returns:
             Uncertainty measure [batch_size, state_dim]
         """
-        if not use_mc_dropout:
-            # Original ensemble uncertainty
-            predictions = self.predict_state_derivative(state, action, return_individual=True)
-            # Ensure predictions is treated as a list of Tensors
-            if not isinstance(predictions, list):
-                predictions = [predictions]
-            stacked_predictions = torch.stack(predictions)  # [ensemble_size, batch_size, state_dim]
-            
-            # Compute variance across the ensemble dimension
-            uncertainty = torch.var(stacked_predictions, dim=0)  # [batch_size, state_dim]
-        else:
-            # Monte Carlo dropout uncertainty
-            all_predictions = []
-            
-            # For each model in the ensemble
-            for model in self.models:
-                # Get multiple predictions with different dropout masks
-                for _ in range(self.mc_dropout_samples):
-                    with torch.no_grad():
-                        prediction = model.predict_state_derivative(state, action, enable_dropout=True)
-                    all_predictions.append(prediction)
-            
-            # Stack all MC predictions [ensemble_size * mc_samples, batch_size, state_dim]
-            stacked_predictions = torch.stack(all_predictions)
-            
-            # Compute variance across all MC samples
-            uncertainty = torch.var(stacked_predictions, dim=0)  # [batch_size, state_dim]
+        # Get predictions from all ensemble members
+        predictions = self.predict_state_derivative(state, action, return_individual=True)
+        
+        # Ensure predictions is treated as a list of Tensors
+        if not isinstance(predictions, list):
+            predictions = [predictions]
+        
+        # Stack and compute variance across ensemble dimension
+        stacked_predictions = torch.stack(predictions)  # [ensemble_size, batch_size, state_dim]
+        uncertainty = torch.var(stacked_predictions, dim=0)  # [batch_size, state_dim]
         
         return uncertainty
     
@@ -672,17 +625,8 @@ class DynamicsEnsembleLightning(pl.LightningModule):
         actions = batch["actions"]
         next_states = batch["next_states"]
         
-        # Use mc_dropout_enabled flag to determine if dropout should be active during inference
-        # By default, dropout is disabled during inference (evaluation mode)
-        with torch.no_grad():
-            pred_next_states = self.predict_next_state(
-                states, 
-                actions, 
-                enable_dropout=self.mc_dropout_enabled
-            )
-            
-            # Compute MSE loss between the predicted and actual next states
-            loss = F.mse_loss(pred_next_states, next_states)
+        # Compute loss (dropout is disabled during evaluation mode)
+        loss = self.compute_loss(states, actions, next_states)
         
         # Log metrics
         self.log("test_loss", loss, on_step=False, on_epoch=True, logger=True)
@@ -792,37 +736,23 @@ class DynamicsEnsembleLightning(pl.LightningModule):
             actions: Batch of actions [batch_size, action_dim]
         """
         with torch.no_grad():
-            # Compute ensemble uncertainty (variance) without MC dropout
-            raw_variance = self.compute_uncertainty(states, actions, use_mc_dropout=False)
+            # Compute ensemble uncertainty (variance)
+            raw_variance = self.compute_uncertainty(states, actions)
             
             # Normalize variance using both methods
             static_norm_variance = self.normalize_variance_static(raw_variance)
             dynamic_norm_variance = self.normalize_variance_dynamic(raw_variance)
             
             # Calculate mean variance across batch and dimensions
-            # We only care about the overall mean, not per-dimension values
             mean_raw_variance = raw_variance.mean().item()
             mean_static_norm = static_norm_variance.mean().item()
             mean_dynamic_norm = dynamic_norm_variance.mean().item()
             
-            # Update dynamic normalization parameter based on current variance
-            # and calculate the current median value
-            flat_variance = raw_variance.flatten().cpu().tolist()
+            # Update dynamic normalization parameter
+            self.update_dynamic_normalization_parameter(raw_variance)
             
-            # Add to the variance history buffer
-            self.variance_history.extend(flat_variance)
-            
-            # Maintain the buffer size limit
-            if len(self.variance_history) > self.variance_buffer_size:
-                # Keep only the most recent values
-                self.variance_history = self.variance_history[-self.variance_buffer_size:]
-            
-            # Calculate median of the variance history
+            # Get current median value for logging
             var_median = torch.tensor(self.variance_history).median().item()
-            
-            # Update c_t using the exponential moving average formula
-            self.dynamic_norm_c = (1 - self.dynamic_norm_alpha) * self.dynamic_norm_c + \
-                                  self.dynamic_norm_alpha * var_median
             
             # Log essential metrics to wandb with trajectory information
             if isinstance(self.logger, pl.loggers.WandbLogger):
