@@ -403,13 +403,15 @@ def train_clf_model(
     # Build CLF model config — explicitly use CLFNetworkLightning, not config.model
     # (config.model defaults to dynamics_ensemble which is wrong for clf_training)
     clf_exp = getattr(config.experiment, "clf", OmegaConf.create({}))
+    exp_const = float(getattr(clf_exp, "exp_const", 1.0))
     config_dict = {
         "_target_": "src.models.clf.CLFNetworkLightning",
         "state_dim": state_dim,
         "hidden_dim": int(getattr(clf_exp, "hidden_dim", 64)),
+        "exp_const": exp_const,
     }
     model_config = OmegaConf.create(config_dict)
-    
+
     # Initialize model with dynamic dimensions
     model = hydra.utils.instantiate(model_config)
 
@@ -421,6 +423,7 @@ def train_clf_model(
         model.qp_solver = CLFQPSolverLightning(
             action_dim=action_dim,
             action_limits=(action_low, action_high),
+            exp_const=exp_const,
         )
 
     # Set pendulum equilibrium on the model buffer so CLF loss targets the right point (L6)
@@ -497,6 +500,7 @@ def evaluate_control_policy(
         qp_solver = CLFQPSolverLightning(
             action_dim=clf_model.qp_solver.action_dim,
             action_limits=(clf_model.qp_solver.action_lower, clf_model.qp_solver.action_upper),
+            exp_const=clf_model.qp_solver.const,
         )
     else:
         qp_solver = CLFQPSolverLightning(action_dim=dynamics_model.action_dim)
@@ -781,10 +785,11 @@ def main(config: DictConfig) -> Dict[str, Any]:
                     "state_dim": state_dim,
                     "hidden_dim": config.experiment.clf.get("hidden_dim", 64),
                     "dropout_rate": 0.1,
-                    "learning_rate": 0.001
+                    "learning_rate": 0.001,
+                    "exp_const": float(config.experiment.clf.get("exp_const", 1.0)),
                 }
                 clf_model_config = OmegaConf.create(clf_config_dict)
-                
+
                 # Initialize CLF model
                 clf_model = hydra.utils.instantiate(clf_model_config)
 
@@ -795,6 +800,7 @@ def main(config: DictConfig) -> Dict[str, Any]:
                 clf_model.qp_solver = CLFQPSolverLightning(
                     action_dim=action_dim,
                     action_limits=(action_low, action_high),
+                    exp_const=float(config.experiment.clf.get("exp_const", 1.0)),
                 )
 
                 # Set equilibrium on model buffer (L6)

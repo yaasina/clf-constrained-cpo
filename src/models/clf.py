@@ -31,7 +31,8 @@ class CLFNetworkLightning(pl.LightningModule):
         nonlinearity: nn.Module = nn.Tanh(),
         output_nonlinearity: Optional[nn.Module] = None,
         loss: Optional[Dict[str, float]] = None,
-        equilibrium: Optional[torch.Tensor] = None
+        equilibrium: Optional[torch.Tensor] = None,
+        exp_const: float = 1.0,
     ) -> None:
         """
         Initialize the CLF network.
@@ -45,6 +46,8 @@ class CLFNetworkLightning(pl.LightningModule):
             output_nonlinearity: Activation function for output layer (None for linear output)
             loss: Dictionary of loss hyperparameters (alpha1, alpha2, alpha3, alpha4)
             equilibrium: Equilibrium state tensor [state_dim]. Defaults to the zero vector.
+            exp_const: Exponential decay constant μ for the CLF condition
+                       L_f_V + L_g_V·u + μ·V(x) ≤ 0 (must be positive for exponential stability).
                          Registered as a buffer so it moves with the model and is saved
                          in checkpoints.
         """
@@ -63,6 +66,7 @@ class CLFNetworkLightning(pl.LightningModule):
         self.alpha2 = self.loss_params.get('alpha2', 0.1)
         self.alpha3 = self.loss_params.get('alpha3', 1.0)
         self.alpha4 = self.loss_params.get('alpha4', 1.0)
+        self.exp_const = exp_const
 
         # Register equilibrium as a buffer so it moves to the right device automatically
         # and is saved / restored with the checkpoint (L6)
@@ -266,14 +270,15 @@ class CLFNetworkLightning(pl.LightningModule):
             dynamics_model: Model of the system dynamics
             
         Returns:
-            Total Lie derivative L_f_V + L_g_V·u [batch_size, 1]
+            CLF condition value L_f_V + L_g_V·u + exp_const·V(x) [batch_size, 1]
         """
         L_f_V, L_g_V = self.lie_derivatives(state, dynamics_model)
-        
-        # Compute L_f_V + L_g_V·u
+
+        # Compute L_f_V + L_g_V·u + exp_const·V(x)
         L_g_V_u = torch.sum(L_g_V * action, dim=1, keepdim=True)
-        L_dot = L_f_V + L_g_V_u
-        
+        V = self.compute_clf(state)
+        L_dot = L_f_V + L_g_V_u + self.exp_const * V
+
         return L_dot
     
     def compute_clf_loss(
@@ -388,11 +393,12 @@ class CLFNetworkLightning(pl.LightningModule):
         alpha2: float = 0.1,  # Weight for relaxation variable term
         alpha3: float = 1.0,  # Weight for lie derivative term
         alpha4: float = 1.0,  # Weight for CLF decrease over time term
+        exp_const: float = 1.0,  # Exponential decay constant for CLF condition
     ) -> Dict[str, torch.Tensor]:
         """
         Compute the self-supervised CLF loss according to the formula:
-        L(θ) = α₁V_θ(0) + (α₂/B)∑ᵢr_i + (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0) + (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
-        
+        L(θ) = α₁V_θ(0) + (α₂/B)∑ᵢr_i + (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i + μ·V_θ(x_i), 0) + (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
+
         Args:
             states: Batch of state vectors [batch_size, state_dim]
             dynamics_model: Model of the system dynamics
@@ -400,7 +406,8 @@ class CLFNetworkLightning(pl.LightningModule):
             next_states: Optional batch of next state vectors [batch_size, state_dim]
             dt: Time step for computing temporal difference
             alpha1-alpha4: Weights for the different loss terms
-            
+            exp_const: Exponential decay constant μ for the CLF condition (must match qp_solver.const)
+
         Returns:
             Dictionary containing individual loss terms and total loss
         """
@@ -411,6 +418,9 @@ class CLFNetworkLightning(pl.LightningModule):
         # Use self.equilibrium buffer; no hard-coded pendulum import (L6).
         equilibrium_value = self.compute_clf(self.equilibrium.to(device).unsqueeze(0))
         loss_equilibrium = alpha1 * equilibrium_value
+
+        # Compute CLF values once — reused in Term 3 and Term 4.
+        clf_values = self.compute_clf(states)
 
         # Compute Lie derivatives for the batch once — reused in Term 3 (G5)
         L_f_V, L_g_V = self.lie_derivatives(states, dynamics_model)
@@ -429,32 +439,33 @@ class CLFNetworkLightning(pl.LightningModule):
         else:
             loss_relaxation = torch.tensor(0.0, device=device, requires_grad=False)
 
-        # Term 3: (α₃/B)∑ᵢmax(L_f V + L_g V·uᵢ, 0) — reuse already-computed L_f_V, L_g_V (G5)
+        # Term 3: (α₃/B)∑ᵢmax(L_f V + L_g V·uᵢ + μ·V(xᵢ), 0)
+        # Enforces the CLF condition L_f_V + L_g_V·u + exp_const·V ≤ 0.
+        # Reuses already-computed L_f_V, L_g_V (G5) and clf_values.
         # u_values needs to be broadcastable with L_g_V [batch_size, action_dim]
         if u_values.dim() == 1:
             u_values = u_values.unsqueeze(-1)
-        L_dot = L_f_V + torch.sum(L_g_V * u_values, dim=1, keepdim=True)
+        L_dot = L_f_V + torch.sum(L_g_V * u_values, dim=1, keepdim=True) + exp_const * clf_values
         loss_lie_derivative = alpha3 * torch.relu(L_dot).mean()
-        
+
         # Term 4: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0) - Ensure CLF decreases over time
         loss_temporal = torch.tensor(0.0, device=device)
         if next_states is not None:
-            current_values = self.compute_clf(states)
             next_values = self.compute_clf(next_states)
-            
+
             # Compute temporal difference rate (V(x+) - V(x))/dt
-            v_dot = (next_values - current_values) / dt
-            
+            v_dot = (next_values - clf_values) / dt
+
             # We want this to be negative, so penalize positive values
             loss_temporal = alpha4 * torch.mean(torch.relu(v_dot))
-        
+
         # Combine all terms
         total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal
-        
+
         return {
             "loss": total_loss,
             "loss_equilibrium": loss_equilibrium,
-            "loss_relaxation": loss_relaxation, 
+            "loss_relaxation": loss_relaxation,
             "loss_lie_derivative": loss_lie_derivative,
             "loss_temporal": loss_temporal
         }
@@ -502,7 +513,8 @@ class CLFNetworkLightning(pl.LightningModule):
                 alpha1=self.alpha1,
                 alpha2=self.alpha2,
                 alpha3=self.alpha3,
-                alpha4=self.alpha4 if next_states is not None else 0.0
+                alpha4=self.alpha4 if next_states is not None else 0.0,
+                exp_const=self.exp_const,
             )
             total_loss = loss_dict["loss"]
             self.log(f"{stage}_loss", total_loss, on_step=on_step, on_epoch=True, prog_bar=True, logger=True)

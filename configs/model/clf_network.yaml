@@ -4,6 +4,7 @@ _target_: src.models.clf.CLFNetworkLightning
 hidden_dim: 64
 dropout_rate: 0.1
 learning_rate: 0.001
+exp_const: 1.0  # Exponential decay constant μ for L_f_V + L_g_V·u + μ·V(x) ≤ 0
 
 # Self-supervised CLF loss hyperparameters
 loss:
@@ -13,7 +14,7 @@ loss:
   # Weight for minimizing relaxation variables: (α₂/B)∑ᵢr_i
   alpha2: 1000.0
   
-  # Weight for enforcing negative Lie derivatives: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i, 0)
+  # Weight for enforcing CLF condition: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i + μ·V_θ(x_i), 0)
   alpha3: 10.0
   
   # Weight for ensuring CLF decreases over time: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
