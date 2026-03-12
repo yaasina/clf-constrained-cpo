@@ -92,6 +92,35 @@ def setup_callbacks(config: DictConfig) -> List[pl.Callback]:
     return callbacks
 
 
+def _make_wandb_logger(
+    config: DictConfig,
+    name: Optional[str] = None,
+    extra_tags: Optional[List[str]] = None,
+    log_model: Optional[bool] = None,
+    notes: Optional[str] = None,
+) -> WandbLogger:
+    """
+    Create a WandbLogger with all OmegaConf containers converted to plain Python types.
+
+    W&B's internal JSON serialiser rejects OmegaConf ListConfig/DictConfig objects
+    and can silently fall back to anonymous mode, causing 401 errors even when
+    credentials are present.  Converting everything to plain Python first avoids this.
+    """
+    tags = list(config.logger.tags) if config.logger.tags else []
+    if extra_tags:
+        tags = tags + list(extra_tags)
+
+    return WandbLogger(
+        project=str(config.logger.project),
+        name=str(name or config.logger.name),
+        save_dir=str(config.logger.save_dir),
+        log_model=log_model if log_model is not None else bool(config.logger.log_model),
+        notes=str(notes or config.logger.notes),
+        tags=tags,
+        group=str(config.logger.group),
+        offline=bool(config.logger.offline),
+    )
+
 def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[str, Any]]:
     """
     Train a dynamics model using PyTorch Lightning.
@@ -106,16 +135,8 @@ def train_dynamics_model(config: DictConfig) -> Tuple[pl.LightningModule, Dict[s
     set_seed(config.seed)
     
     # Initialize logger
-    logger = WandbLogger(
-        project=config.logger.project,
-        name=config.logger.name,
-        save_dir=config.logger.save_dir,
-        log_model=config.logger.log_model,
-        notes=config.logger.notes,
-        tags=config.logger.tags,
-        group=config.logger.group
-    )
-    
+    logger = _make_wandb_logger(config)
+
     # Initialize environment if using environment data
     env = None
     if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
@@ -298,24 +319,27 @@ def train_clf_model(
     set_seed(config.seed)
     
     # Initialize logger
-    logger = WandbLogger(
-        project=config.logger.project,
-        name=config.logger.name,
-        save_dir=config.logger.save_dir,
-        log_model=config.logger.log_model,
-        notes=config.logger.notes,
-        tags=config.logger.tags,
-        group=config.logger.group
-    )
-    
+    logger = _make_wandb_logger(config)
+
     # Initialize environment to collect states
     env = None
     states = None
+    state_dim = None
+    action_dim = None
+    action_low = None
+    action_high = None
     if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
         from data_collection import collect_trajectory, process_trajectory
-        
+
         print(f"Setting up environment for CLF training: {config.experiment.env_name}")
         env = gym.make(config.experiment.env_name)
+        # Infer dims and action limits from env spaces — no need for explicit config values
+        state_dim = get_space_dimension(env.observation_space)
+        action_dim = get_space_dimension(env.action_space)
+        action_low = float(env.action_space.low.min())
+        action_high = float(env.action_space.high.max())
+        print(f"Inferred from environment: state_dim={state_dim}, action_dim={action_dim}, "
+              f"action_limits=({action_low}, {action_high})")
         
         # Collect trajectories to generate state samples for CLF training
         num_trajectories = config.experiment.data.get('num_trajectories', 5)
@@ -342,7 +366,14 @@ def train_clf_model(
         
         # Clean up environment
         env.close()
-    
+
+    if states is None:
+        raise ValueError(
+            "No state data available for CLF training. "
+            "Set config.experiment.env_name to collect data from an environment, "
+            "or set config.experiment.data.data_path to load from a file."
+        )
+
     # Direct instantiation — avoids _target_ string issues (L4)
     data_module = CLFDataModule(
         states=states,
@@ -365,18 +396,18 @@ def train_clf_model(
     # Extract dimensions from the data
     # Get a batch from the training dataloader to determine dimensions
     batch = next(iter(data_module.train_dataloader()))
-    state_dim = batch["states"].shape[1]
-    
-    # Also get action_dim from dynamics model if available
-    action_dim = None
-    if dynamics_model is not None and hasattr(dynamics_model, 'action_dim'):
-        action_dim = dynamics_model.action_dim
-    
-    # Update the config with the inferred dimensions
-    config_dict = OmegaConf.to_container(config.model, resolve=True)
-    config_dict.update({"state_dim": state_dim})
-    if action_dim is not None:
-        config_dict.update({"action_dim": action_dim})
+    if state_dim is None:
+        state_dim = batch["states"].shape[1]
+    # action_dim already set from env; no dynamics model fallback needed
+
+    # Build CLF model config — explicitly use CLFNetworkLightning, not config.model
+    # (config.model defaults to dynamics_ensemble which is wrong for clf_training)
+    clf_exp = getattr(config.experiment, "clf", OmegaConf.create({}))
+    config_dict = {
+        "_target_": "src.models.clf.CLFNetworkLightning",
+        "state_dim": state_dim,
+        "hidden_dim": int(getattr(clf_exp, "hidden_dim", 64)),
+    }
     model_config = OmegaConf.create(config_dict)
     
     # Initialize model with dynamic dimensions
@@ -387,7 +418,10 @@ def train_clf_model(
 
     # Attach QP solver so training_step can use the full self-supervised CLF loss (C5)
     if action_dim is not None:
-        model.qp_solver = CLFQPSolverLightning(action_dim=action_dim)
+        model.qp_solver = CLFQPSolverLightning(
+            action_dim=action_dim,
+            action_limits=(action_low, action_high),
+        )
 
     # Set pendulum equilibrium on the model buffer so CLF loss targets the right point (L6)
     if hasattr(model, 'equilibrium'):
@@ -397,15 +431,9 @@ def train_clf_model(
         except Exception:
             pass
 
-    # Log the inferred dimensions
-    logger.experiment.config.update({
-        "state_dim": state_dim
-    })
-    if action_dim is not None:
-        logger.experiment.config.update({"action_dim": action_dim})
-    
-    print(f"Inferred dimensions from data: state_dim={state_dim}" + 
-          (f", action_dim={action_dim}" if action_dim is not None else ""))
+    print(f"Inferred dimensions from data: state_dim={state_dim}" +
+          (f", action_dim={action_dim}, action_limits=({action_low}, {action_high})"
+           if action_dim is not None else ""))
     
     # Set up callbacks
     callbacks = setup_callbacks(config)
@@ -423,7 +451,10 @@ def train_clf_model(
         gradient_clip_val=config.training.gradient_clip_val,
         val_check_interval=config.training.val_check_interval,
         precision=config.device.precision,
-        num_sanity_val_steps=num_sanity_val_steps
+        num_sanity_val_steps=num_sanity_val_steps,
+        # CLF Lie-derivative computation uses autograd.grad during val/test;
+        # inference_mode=True (PL default) blocks enable_grad() so we use no_grad instead.
+        inference_mode=False,
     )
     
     # Train model
@@ -460,24 +491,29 @@ def evaluate_control_policy(
     Returns:
         Evaluation results
     """
-    # Initialize QP solver
-    qp_solver = hydra.utils.instantiate(
-        config.experiment.clf.qp_solver,
-        _target_=CLFQPSolverLightning
-    )
+    # Initialize QP solver — infer action_dim and action_limits from the trained clf_model.qp_solver
+    # so no config values are needed (they were already set from the env during training).
+    if hasattr(clf_model, 'qp_solver') and clf_model.qp_solver is not None:
+        qp_solver = CLFQPSolverLightning(
+            action_dim=clf_model.qp_solver.action_dim,
+            action_limits=(clf_model.qp_solver.action_lower, clf_model.qp_solver.action_upper),
+        )
+    else:
+        qp_solver = CLFQPSolverLightning(action_dim=dynamics_model.action_dim)
     
     # Initialize wandb logger for visualizations
-    logger = WandbLogger(
-        project=config.logger.project,
+    logger = _make_wandb_logger(
+        config,
         name=f"{config.logger.name}_eval",
-        save_dir=config.logger.save_dir,
+        extra_tags=["evaluation"],
         log_model=False,
         notes=f"Evaluation of {config.logger.name}",
-        tags=config.logger.tags + ["evaluation"],
-        group=config.logger.group
     )
     
-    qp_solver.logger = logger
+    # Supply the W&B logger for standalone visualisation logging.
+    # LightningModule.logger is a read-only property set by the Trainer, so
+    # we use the custom _eval_logger attribute instead.
+    qp_solver._eval_logger = logger
     
     # Set up test states (grid or samples)
     if hasattr(config.experiment, "eval_grid") and config.experiment.eval_grid:
@@ -587,6 +623,9 @@ def main(config: DictConfig) -> Dict[str, Any]:
             
             print(f"Setting up environment: {config.experiment.env_name}")
             env = gym.make(config.experiment.env_name)
+            # Infer action limits from env — only env_name needs to be user-configured
+            action_low = float(env.action_space.low.min())
+            action_high = float(env.action_space.high.max())
         else:
             raise ValueError("Environment name must be provided for full pipeline")
         
@@ -605,25 +644,19 @@ def main(config: DictConfig) -> Dict[str, Any]:
         clf_model = None
         
         # Initialize logger for dynamics
-        dynamics_logger = WandbLogger(
-            project=config.logger.project,
+        dynamics_logger = _make_wandb_logger(
+            config,
             name=f"{config.logger.name}_dynamics",
-            save_dir=config.logger.save_dir,
-            log_model=config.logger.log_model,
+            extra_tags=["dynamics"],
             notes=f"{config.logger.notes} - Dynamics",
-            tags=config.logger.tags + ["dynamics"],
-            group=config.logger.group
         )
-        
+
         # Initialize logger for CLF
-        clf_logger = WandbLogger(
-            project=config.logger.project,
+        clf_logger = _make_wandb_logger(
+            config,
             name=f"{config.logger.name}_clf",
-            save_dir=config.logger.save_dir,
-            log_model=config.logger.log_model,
+            extra_tags=["clf"],
             notes=f"{config.logger.notes} - CLF",
-            tags=config.logger.tags + ["clf"],
-            group=config.logger.group
         )
         
         # Setup callbacks
@@ -759,7 +792,10 @@ def main(config: DictConfig) -> Dict[str, Any]:
                 clf_model.dynamics_model = dynamics_model
 
                 # Attach QP solver for full self-supervised CLF loss (C5)
-                clf_model.qp_solver = CLFQPSolverLightning(action_dim=action_dim)
+                clf_model.qp_solver = CLFQPSolverLightning(
+                    action_dim=action_dim,
+                    action_limits=(action_low, action_high),
+                )
 
                 # Set equilibrium on model buffer (L6)
                 if hasattr(clf_model, 'equilibrium'):
@@ -785,6 +821,9 @@ def main(config: DictConfig) -> Dict[str, Any]:
                 precision=config.device.precision,
                 log_every_n_steps=config.experiment.training.get("log_every_n_steps", 2),
                 num_sanity_val_steps=num_sanity_val_steps if traj_idx == 0 else 0,
+                # CLF Lie-derivative computation uses autograd.grad during val/test;
+                # inference_mode=True (PL default) blocks enable_grad() so use no_grad.
+                inference_mode=False,
             )
             
             # Train CLF model using the current dataset and updated dynamics model

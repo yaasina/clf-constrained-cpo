@@ -3,7 +3,7 @@ _target_: pytorch_lightning.loggers.WandbLogger
 project: "clf-constrained-cpo"
 name: ${experiment.name}
 save_dir: ${hydra:runtime.output_dir}/logs
-log_model: true
+log_model: false
 notes: ${experiment.description}
 tags: ["${experiment.task}"]
 group: ${experiment.name}

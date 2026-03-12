@@ -52,9 +52,23 @@ class CLFQPSolverLightning(pl.LightningModule):
         self.const = exp_const
         self.max_retries = max_retries
         self.verbose = verbose
-        
-        # QP problem will be set up later when action_dim is known
-        self.qp_layer = None
+
+        # Logger override for standalone evaluation (outside a Trainer).
+        # Use qp_solver._eval_logger = wandb_logger instead of the read-only
+        # LightningModule.logger property.
+        self._eval_logger: Optional[pl.loggers.WandbLogger] = None
+
+        # QP problem will be set up later when action_dim is known.
+        # _qp_ready tracks whether _setup_qp_problem has completed successfully.
+        # Avoid using `self.qp_layer is None` as a check: CvxpyLayer is an
+        # nn.Module so PyTorch stores it in _modules, while the initial None is
+        # stored in __dict__; the bool flag sidesteps that ambiguity.
+        self._qp_ready: bool = False
+        self.qp_layer = None  # replaced by CvxpyLayer in _setup_qp_problem
+
+        # Call setup immediately if action_dim is already known.
+        if self.action_dim is not None:
+            self._setup_qp_problem()
         
         # Initialize storage for results
         self.reset_values()
@@ -90,11 +104,12 @@ class CLFQPSolverLightning(pl.LightningModule):
         
         # Create CvxpyLayer for differentiable optimization
         self.qp_layer = CvxpyLayer(
-            problem, 
-            parameters=[L_f_V, L_g_V, V], 
+            problem,
+            parameters=[L_f_V, L_g_V, V],
             variables=[u, r],
             gp=False  # Not a geometric program
         )
+        self._qp_ready = True
 
     def reset_values(self) -> None:
         """Reset stored values from previous optimizations"""
@@ -106,6 +121,21 @@ class CLFQPSolverLightning(pl.LightningModule):
             'failure_count': 0,
             'retry_count': 0
         }
+
+    @property
+    def _active_logger(self) -> Optional[pl.loggers.WandbLogger]:
+        """Return the active W&B logger for visualisation logging.
+
+        During Lightning training self.logger (set by Trainer) is used.
+        For standalone evaluation (no Trainer attached), callers can set
+        `solver._eval_logger = wandb_logger` to supply one explicitly.
+        """
+        if self._eval_logger is not None:
+            return self._eval_logger
+        try:
+            return self.logger
+        except Exception:
+            return None
 
     def solve_point(
         self, 
@@ -154,7 +184,7 @@ class CLFQPSolverLightning(pl.LightningModule):
                     print(f"Automatically determined action_dim = {self.action_dim}")
         
         # Check if QP layer is set up
-        if self.qp_layer is None:
+        if not self._qp_ready:
             raise ValueError("QP solver not initialized. action_dim could not be determined.")
         
         # Attempt to solve with retries
@@ -241,7 +271,19 @@ class CLFQPSolverLightning(pl.LightningModule):
             # Calculate V, L_f_V, and L_g_V for the batch
             V_batch = clf_net.compute_clf(batch)
             L_f_V_batch, L_g_V_batch = clf_net.lie_derivatives(batch, dynamics_model)
-            
+
+            # Determine action_dim if not already set (mirrors solve_point lazy-init)
+            if self.action_dim is None:
+                if L_g_V_batch.dim() > 2:  # [batch, state_dim, action_dim]
+                    self.action_dim = L_g_V_batch.shape[2]
+                else:  # [batch, action_dim]
+                    self.action_dim = L_g_V_batch.shape[1]
+                if self.action_dim is not None:
+                    self._setup_qp_problem()
+
+            if not self._qp_ready:
+                raise ValueError("QP solver not initialized. action_dim could not be determined.")
+
             # Solve for each point in the batch
             for j in range(len(batch)):
                 L_f_V = L_f_V_batch[j].reshape(1, 1)
@@ -296,7 +338,7 @@ class CLFQPSolverLightning(pl.LightningModule):
             print(f"Failed points: {len(failed_indices)}/{total_points} ({len(failed_indices)/total_points*100:.2f}%)")
         
         # Log results to W&B if requested
-        if log_results and hasattr(self, 'logger') and isinstance(self.logger, pl.loggers.WandbLogger):
+        if log_results and hasattr(self, 'logger') and isinstance(self._active_logger, pl.loggers.WandbLogger):
             self._log_qp_results_wandb(dataset, u_values, r_values, failed_indices, clf_net, dynamics_model)
         
         return {
@@ -380,7 +422,7 @@ class CLFQPSolverLightning(pl.LightningModule):
             admissible_controls = control_samples[admissible_mask.squeeze()]
             
             # Log visualization if requested
-            if log_results and hasattr(self, 'logger') and isinstance(self.logger, pl.loggers.WandbLogger):
+            if log_results and hasattr(self, 'logger') and isinstance(self._active_logger, pl.loggers.WandbLogger):
                 self._log_admissible_controls_1d_wandb(
                     state, control_samples, lie_derivatives, admissible_controls, clf_net, dynamics_model
                 )
@@ -414,7 +456,7 @@ class CLFQPSolverLightning(pl.LightningModule):
                 admissible_controls = control_samples[admissible_mask]
                 
                 # Log visualization if requested
-                if log_results and hasattr(self, 'logger') and isinstance(self.logger, pl.loggers.WandbLogger):
+                if log_results and hasattr(self, 'logger') and isinstance(self._active_logger, pl.loggers.WandbLogger):
                     self._log_admissible_controls_2d_wandb(
                         state, control_samples, lie_derivatives, admissible_controls, 
                         u1_samples, u2_samples, U1, U2, clf_net, dynamics_model
@@ -513,8 +555,8 @@ class CLFQPSolverLightning(pl.LightningModule):
                 )
                 
                 # Log to wandb
-                if isinstance(self.logger, pl.loggers.WandbLogger):
-                    self.logger.experiment.log({"qp_control_vs_norm": fig}, step=self.global_step)
+                if isinstance(self._active_logger, pl.loggers.WandbLogger):
+                    self._active_logger.experiment.log({"qp_control_vs_norm": fig}, step=self.global_step)
 
                 # Create histogram of relaxation values
                 fig = go.Figure()
@@ -533,8 +575,8 @@ class CLFQPSolverLightning(pl.LightningModule):
                 )
                 
                 # Log to wandb
-                if isinstance(self.logger, pl.loggers.WandbLogger):
-                    self.logger.experiment.log({"qp_relaxation_histogram": fig}, step=self.global_step)
+                if isinstance(self._active_logger, pl.loggers.WandbLogger):
+                    self._active_logger.experiment.log({"qp_relaxation_histogram": fig}, step=self.global_step)
 
             # Create visualization of resulting Lie derivatives with the computed control
             # Sample a subset of states for visualization (P3: use seeded torch.randperm)
@@ -591,8 +633,8 @@ class CLFQPSolverLightning(pl.LightningModule):
             )
             
             # Log to wandb
-            if isinstance(self.logger, pl.loggers.WandbLogger):
-                self.logger.experiment.log({"lie_derivative_with_qp_control": fig}, step=self.global_step)
+            if isinstance(self._active_logger, pl.loggers.WandbLogger):
+                self._active_logger.experiment.log({"lie_derivative_with_qp_control": fig}, step=self.global_step)
 
     def _log_admissible_controls_1d_wandb(
         self,
@@ -690,8 +732,8 @@ class CLFQPSolverLightning(pl.LightningModule):
             )
 
             # Log to wandb
-            if isinstance(self.logger, pl.loggers.WandbLogger):
-                self.logger.experiment.log({"admissible_controls_1d": fig}, step=self.global_step)
+            if isinstance(self._active_logger, pl.loggers.WandbLogger):
+                self._active_logger.experiment.log({"admissible_controls_1d": fig}, step=self.global_step)
     
     def _log_admissible_controls_2d_wandb(
         self,
@@ -844,5 +886,5 @@ class CLFQPSolverLightning(pl.LightningModule):
             fig.update_yaxes(title_text="Control u2", row=1, col=2)
             
             # Log to wandb
-            if isinstance(self.logger, pl.loggers.WandbLogger):
-                self.logger.experiment.log({"admissible_controls_2d": fig}, step=self.global_step)
+            if isinstance(self._active_logger, pl.loggers.WandbLogger):
+                self._active_logger.experiment.log({"admissible_controls_2d": fig}, step=self.global_step)

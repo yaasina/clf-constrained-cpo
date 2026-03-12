@@ -57,8 +57,7 @@ clf:
   # QP solver parameters for evaluation
   qp_solver:
     lambda_param: 1.0
-    action_limits: [-5.0, 5.0]
-    # action_dim: 1          # Add the missing action_dim parameter
+    # action_limits and action_dim inferred from env.action_space automatically
 
 # Evaluation settings
 evaluate_control: true     # Evaluate the control policy after training

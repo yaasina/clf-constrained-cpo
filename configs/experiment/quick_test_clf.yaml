@@ -16,8 +16,7 @@ data:
 
 # Environment settings
 env_name: "Pendulum-v1"    # Using pendulum as the test environment
-state_dim: 3               # Pendulum state dimension
-action_dim: 1              # Pendulum action dimension
+# state_dim and action_dim are inferred from the environment automatically
 
 # Load pre-trained dynamics model
 dynamics_model_path: "outputs/quick_test/2025-05-01/06-47-07/checkpoints/epoch_epoch=019.ckpt" # Path to our trained dynamics model
@@ -49,7 +48,7 @@ clf:
   # QP solver parameters for evaluation
   qp_solver:
     lambda_param: 1.0
-    action_limits: [-5.0, 5.0]
+    # action_limits inferred from env.action_space automatically
 
 # Training overrides for faster execution
 training:

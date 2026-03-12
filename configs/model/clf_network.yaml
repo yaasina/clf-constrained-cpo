@@ -8,7 +8,7 @@ learning_rate: 0.001
 # Self-supervised CLF loss hyperparameters
 loss:
   # Weight for minimizing CLF value at equilibrium: α₁V_θ(0)
-  alpha1: 1.0
+  alpha1: 100.0
   
   # Weight for minimizing relaxation variables: (α₂/B)∑ᵢr_i
   alpha2: 1000.0

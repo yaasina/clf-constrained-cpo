@@ -141,10 +141,14 @@ class CLFNetworkLightning(pl.LightningModule):
             Gradient of L(x) with respect to x [batch_size, state_dim]
         """
         state_grad = state.detach().clone().requires_grad_(True)
-        clf_sum = self.compute_clf(state_grad).sum()
-        gradients = torch.autograd.grad(
-            clf_sum, state_grad, create_graph=True
-        )[0]
+        # enable_grad ensures this works even when called from validation_step
+        # which Lightning wraps in torch.no_grad().  create_graph is only needed
+        # during training (for second-order loss terms).
+        with torch.enable_grad():
+            clf_sum = self.compute_clf(state_grad).sum()
+            gradients = torch.autograd.grad(
+                clf_sum, state_grad, create_graph=self.training
+            )[0]
         return gradients
     
     def _compute_gradient_fd(self, state: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
@@ -575,8 +579,8 @@ class CLFNetworkLightning(pl.LightningModule):
         # gradient() uses autograd.grad; use enable_grad() so this is safe
         # even if called from within a torch.no_grad() scope (C1).
         with torch.enable_grad():
-            # Compute CLF values
-            clf_values = self.compute_clf(states)
+            # Compute CLF values (detach: this is visualisation only, no backprop needed)
+            clf_values = self.compute_clf(states).detach()
             
             # If state dimension is 2, create a 3D surface plot
             if self.state_dim == 2 and states.shape[0] >= 100:
@@ -589,7 +593,7 @@ class CLFNetworkLightning(pl.LightningModule):
                         # States are on a grid
                         x = states[:, 0].cpu().numpy().reshape(grid_size, grid_size)
                         y = states[:, 1].cpu().numpy().reshape(grid_size, grid_size)
-                        z = clf_values.cpu().numpy().reshape(grid_size, grid_size)
+                        z = clf_values.detach().cpu().numpy().reshape(grid_size, grid_size)
                         
                         # Create 3D surface plot
                         fig = go.Figure(data=[go.Surface(z=z, x=x, y=y)])
@@ -611,7 +615,7 @@ class CLFNetworkLightning(pl.LightningModule):
             
             # Create a scatter plot of CLF values vs. state norm
             state_norms = torch.norm(states, dim=1).cpu().numpy()
-            clf_vals = clf_values.squeeze().cpu().numpy()
+            clf_vals = clf_values.detach().squeeze().cpu().numpy()
             
             fig = go.Figure()
             fig.add_trace(
@@ -669,7 +673,7 @@ class CLFNetworkLightning(pl.LightningModule):
                         mode="markers",
                         marker=dict(
                             size=8,
-                            color=clf_values.squeeze().cpu().numpy(),
+                            color=clf_values.detach().squeeze().cpu().numpy(),
                             colorscale="Viridis",
                             showscale=True,
                             colorbar=dict(title="CLF Value")
@@ -904,22 +908,20 @@ class CLFNetworkLightning(pl.LightningModule):
             # Continue without the grid-based visualizations
     
     def on_train_batch_end(
-        self, 
-        outputs: Dict[str, torch.Tensor], 
-        batch: Dict[str, torch.Tensor], 
-        batch_idx: int, 
-        dataloader_idx: int = 0
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int,
     ) -> None:
         """
         Called at the end of each training batch. Track CLF value at equilibrium.
-        
+
         Args:
             outputs: Outputs from the training step
             batch: Current batch of data
             batch_idx: Index of the current batch
-            dataloader_idx: Index of the current dataloader
         """
-        super().on_train_batch_end(outputs, batch, batch_idx, dataloader_idx)
+        super().on_train_batch_end(outputs, batch, batch_idx)
         
         # Log equilibrium value at regular intervals
         # Compute on device to avoid unnecessary transfers

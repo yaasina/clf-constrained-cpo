@@ -18,8 +18,7 @@ data:
 
 # Environment settings
 env_name: "Pendulum-v1"    # Using pendulum as the test environment
-state_dim: 3               # Pendulum state dimension
-action_dim: 1              # Pendulum action dimension
+# state_dim and action_dim are inferred from the environment automatically
 
 # Dynamics-specific settings
 dynamics:

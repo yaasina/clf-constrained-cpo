@@ -1,7 +1,10 @@
 # Default experiment configuration
 name: default_experiment
-description: "Default experiment configuration for dynamics learning"
-task: dynamics_learning  # Options: dynamics_learning, clf_training
+description: "Default experiment configuration for CLF training on Pendulum-v1"
+task: clf_training  # Options: dynamics_learning, clf_training
+
+# Environment settings
+env_name: "Pendulum-v1"  # Pendulum environment for CLF training data collection
 
 # Data configuration
 data:
@@ -34,6 +37,5 @@ clf:
   lambda_param: 1.0  # Weight on the relaxation variable
   exp_const: 1.0     # Exponential constant for CLF decrease rate
   qp_solver:
-    action_limits: [-5.0, 5.0]
     max_retries: 3
     verbose: false

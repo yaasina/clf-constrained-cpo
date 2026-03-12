@@ -86,3 +86,4 @@ data/*.h5
 
 # Notes and drafs
 notes/
+debug/
