@@ -73,7 +73,7 @@ def _init_wandb_run(
         tags=tags,
         group=str(config.logger.group),
         mode="offline" if bool(config.logger.offline) else "online",
-        reinit=True,
+        reinit="create_new",
     )
     return run
 
@@ -313,7 +313,6 @@ def _make_trainer(
     min_epochs: int = 1,
     wandb_run=None,
     log_every_n_steps: int = 1,
-    inference_mode: bool = True,  # kept for signature compat; no-op in custom Trainer
     device: torch.device = None,
 ) -> Trainer:
     """Build a Trainer from Hydra config."""
@@ -332,242 +331,14 @@ def _make_trainer(
     )
 
 
-# ── Training functions ─────────────────────────────────────────────────────────
-
-def train_dynamics_model(config: DictConfig) -> Tuple[nn.Module, Dict[str, Any]]:
-    """Train a dynamics model incrementally over collected trajectories."""
-    set_seed(config.seed)
-    device = _get_device(config.device.accelerator, config.device.devices)
-
-    wandb_run = _init_wandb_run(config)
-
-    env = None
-    if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
-        from data_collection import collect_trajectory, process_trajectory
-        print(f"Setting up environment: {config.experiment.env_name}")
-        env = gym.make(config.experiment.env_name)
-
-    num_trajectories = config.experiment.data.get('num_trajectories', 20)
-    traj_length = config.experiment.data.get('traj_length', 200)
-    buffer_size = config.experiment.data.get('buffer_size', num_trajectories)
-    epochs_per_trajectory = config.experiment.data.get('epochs_per_trajectory', 5)
-    batch_size = config.experiment.training.get("batch_size", config.training.batch_size)
-    log_every_n_steps = config.experiment.training.get(
-        "log_every_n_steps", max(1, epochs_per_trajectory // 2)
-    )
-
-    state_dim = None
-    action_dim = None
-    model = None
-    trajectory_buffer = []
-    total_epochs_trained = 0
-    trainer = None
-
-    for traj_idx in range(num_trajectories):
-        print(f"\n=== Collecting trajectory {traj_idx+1}/{num_trajectories} ===")
-
-        if env is not None:
-            new_trajectory = collect_trajectory(env, length=traj_length, random_seed=config.seed + traj_idx)
-            trajectory_buffer.append(new_trajectory)
-            if len(trajectory_buffer) > buffer_size:
-                trajectory_buffer.pop(0)
-            states, actions, next_states = process_trajectory(trajectory_buffer)
-            print(f"Dataset size after trajectory {traj_idx+1}: {states.shape[0]} samples")
-        else:
-            raise ValueError("Neither environment nor data path specified for training")
-
-        data_module = DynamicsDataModule(
-            batch_size=batch_size,
-            num_workers=config.experiment.training.get("num_workers", 4),
-            normalize=config.experiment.dynamics.get("normalize_data", True),
-            random_seed=config.seed,
-            states=states,
-            actions=actions,
-            next_states=next_states,
-            persistent_workers=config.experiment.data.get("persistent_workers", False),
-            train_ratio=config.experiment.data.get("train_ratio", 0.8),
-            val_ratio=config.experiment.data.get("val_ratio", 0.1),
-            test_ratio=config.experiment.data.get("test_ratio", 0.1),
-        )
-        data_module.prepare_data()
-        data_module.setup()
-
-        if model is None:
-            if env is not None:
-                state_dim = get_space_dimension(env.observation_space)
-                action_dim = get_space_dimension(env.action_space)
-            else:
-                batch = next(iter(data_module.train_dataloader()))
-                state_dim = batch["states"].shape[1]
-                action_dim = batch["actions"].shape[1]
-
-            config_dict = OmegaConf.to_container(config.model, resolve=True)
-            config_dict.update({"state_dim": state_dim, "action_dim": action_dim})
-            model_config = OmegaConf.create(config_dict)
-            model = hydra.utils.instantiate(model_config)
-
-            wandb_run.config.update({
-                "state_dim": state_dim,
-                "action_dim": action_dim,
-                "epochs_per_trajectory": epochs_per_trajectory,
-                "buffer_size": buffer_size,
-            })
-            print(f"Inferred dimensions: state_dim={state_dim}, action_dim={action_dim}")
-
-        trainer = _make_trainer(
-            config,
-            max_epochs=total_epochs_trained + epochs_per_trajectory,
-            min_epochs=total_epochs_trained + 1,
-            wandb_run=wandb_run,
-            log_every_n_steps=log_every_n_steps,
-            device=device,
-        )
-        print(f"Training for {epochs_per_trajectory} epochs on trajectory {traj_idx+1}")
-        trainer.fit(model, data_module)
-        total_epochs_trained += epochs_per_trajectory
-
-        wandb_run.log({
-            "trajectory_completed": traj_idx + 1,
-            "total_epochs_trained": total_epochs_trained,
-        })
-
-    print("\n=== Testing final model ===")
-    test_results = trainer.test(model, data_module) if trainer is not None else []
-
-    best_model_path = trainer.best_model_path if trainer is not None else None
-    print(f"Best model path: {best_model_path}")
-    wandb_run.summary.update({"best_model_path": str(best_model_path or "")})
-
-    if env is not None:
-        env.close()
-
-    wandb_run.finish()
-    return model, {"test_results": test_results, "best_model_path": best_model_path}
-
-
-def train_clf_model(
-    config: DictConfig,
-    dynamics_model: Optional[nn.Module] = None
-) -> Tuple[nn.Module, Dict[str, Any]]:
-    """Train a CLF model."""
-    set_seed(config.seed)
-    device = _get_device(config.device.accelerator, config.device.devices)
-
-    wandb_run = _init_wandb_run(config)
-
-    env = None
-    states = None
-    state_dim = None
-    action_dim = None
-    action_low = None
-    action_high = None
-
-    if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
-        from data_collection import collect_trajectory, process_trajectory
-
-        print(f"Setting up environment for CLF training: {config.experiment.env_name}")
-        env = gym.make(config.experiment.env_name)
-        state_dim = get_space_dimension(env.observation_space)
-        action_dim = get_space_dimension(env.action_space)
-        action_low = float(env.action_space.low.min())
-        action_high = float(env.action_space.high.max())
-        print(f"Inferred from environment: state_dim={state_dim}, action_dim={action_dim}, "
-              f"action_limits=({action_low}, {action_high})")
-
-        num_trajectories = config.experiment.data.get('num_trajectories', 5)
-        traj_length = config.experiment.data.get('traj_length', 50)
-        trajectory_buffer = []
-
-        for traj_idx in range(num_trajectories):
-            print(f"\n=== Collecting trajectory {traj_idx+1}/{num_trajectories} for CLF training ===")
-            new_trajectory = collect_trajectory(env, length=traj_length, random_seed=config.seed + traj_idx)
-            trajectory_buffer.append(new_trajectory)
-
-        states, _, _ = process_trajectory(trajectory_buffer)
-        print(f"Generated dataset for CLF training: {states.shape[0]} state samples")
-        env.close()
-
-    if states is None:
-        raise ValueError(
-            "No state data available for CLF training. Set config.experiment.env_name."
-        )
-
-    data_module = CLFDataModule(
-        states=states,
-        batch_size=config.experiment.training.get("batch_size", config.training.batch_size),
-        num_workers=config.experiment.training.get("num_workers", 4),
-        normalize=config.experiment.dynamics.get("normalize_data", True),
-        random_seed=config.seed,
-        persistent_workers=config.experiment.data.get("persistent_workers", False),
-        train_ratio=config.experiment.data.get("train_ratio", 0.8),
-        val_ratio=config.experiment.data.get("val_ratio", 0.1),
-        test_ratio=config.experiment.data.get("test_ratio", 0.1),
-    )
-    if hasattr(config.experiment.data, "data_path") and config.experiment.data.data_path:
-        data_module.data_path = config.experiment.data.data_path
-
-    data_module.prepare_data()
-    data_module.setup()
-
-    batch = next(iter(data_module.train_dataloader()))
-    if state_dim is None:
-        state_dim = batch["states"].shape[1]
-
-    clf_exp = getattr(config.experiment, "clf", OmegaConf.create({}))
-    exp_const = float(getattr(clf_exp, "exp_const", 1.0))
-    config_dict = {
-        "_target_": "src.models.clf.CLFNetwork",
-        "state_dim": state_dim,
-        "hidden_dim": int(getattr(clf_exp, "hidden_dim", 64)),
-        "exp_const": exp_const,
-    }
-    model_config = OmegaConf.create(config_dict)
-    model = hydra.utils.instantiate(model_config)
-
-    model.dynamics_model = dynamics_model
-
-    if action_dim is not None:
-        model.qp_solver = CLFQPSolver(
-            action_dim=action_dim,
-            action_limits=(action_low, action_high),
-            exp_const=exp_const,
-        )
-
-    if hasattr(model, 'equilibrium'):
-        try:
-            from pendulum_utils import get_pendulum_equilibrium
-            model.equilibrium.copy_(get_pendulum_equilibrium())
-        except Exception:
-            pass
-
-    print(f"Inferred dimensions: state_dim={state_dim}" +
-          (f", action_dim={action_dim}, action_limits=({action_low}, {action_high})"
-           if action_dim is not None else ""))
-
-    trainer = _make_trainer(
-        config,
-        max_epochs=config.training.max_epochs,
-        wandb_run=wandb_run,
-        inference_mode=False,  # CLF gradient() needs grad tracking
-        device=device,
-    )
-    trainer.fit(model, data_module)
-    test_results = trainer.test(model, data_module)
-
-    best_model_path = trainer.best_model_path
-    print(f"Best model path: {best_model_path}")
-    wandb_run.summary.update({"best_model_path": str(best_model_path or "")})
-
-    wandb_run.finish()
-    return model, {"test_results": test_results, "best_model_path": best_model_path}
-
+# ── Training pipeline ──────────────────────────────────────────────────────────
 
 def evaluate_control_policy(
     config: DictConfig,
     clf_model: nn.Module,
     dynamics_model: nn.Module
 ) -> Dict[str, Any]:
-    """Evaluate the CLF-QP control policy."""
+    """Evaluate the CLF-QP control policy and log results to a dedicated W&B run."""
     if hasattr(clf_model, 'qp_solver') and clf_model.qp_solver is not None:
         qp_solver = CLFQPSolver(
             action_dim=clf_model.qp_solver.action_dim,
@@ -581,11 +352,8 @@ def evaluate_control_policy(
         config,
         name=f"{config.logger.name}_eval",
         extra_tags=["evaluation"],
-        log_model=False,
         notes=f"Evaluation of {config.logger.name}",
     )
-
-    # Supply W&B run for standalone evaluation visualizations (S5 pattern)
     qp_solver._eval_logger = wandb_run
 
     if hasattr(config.experiment, "eval_grid") and config.experiment.eval_grid:
@@ -606,25 +374,7 @@ def evaluate_control_policy(
     results = qp_solver.solve_batch(
         states, clf_model, dynamics_model,
         batch_size=config.training.batch_size,
-        log_results=True
     )
-
-    if hasattr(config.experiment, "visualize_admissible_controls") and config.experiment.visualize_admissible_controls:
-        state_norms = torch.norm(states, dim=1)
-        close_idx = torch.where((state_norms > 0.5) & (state_norms < 1.0))[0]
-        mid_idx = torch.where((state_norms > 1.5) & (state_norms < 2.0))[0]
-        far_idx = torch.where(state_norms > 2.5)[0]
-
-        sample_states = []
-        if len(close_idx) > 0:
-            sample_states.append(states[close_idx[0]])
-        if len(mid_idx) > 0:
-            sample_states.append(states[mid_idx[0]])
-        if len(far_idx) > 0:
-            sample_states.append(states[far_idx[0]])
-
-        for state in sample_states:
-            qp_solver.compute_admissible_control_set(state, clf_model, dynamics_model, num_samples=1000, log_results=True)
 
     wandb_run.finish()
     return results
@@ -635,215 +385,225 @@ def evaluate_control_policy(
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
 def main(config: DictConfig) -> Dict[str, Any]:
     print(OmegaConf.to_yaml(config))
+    set_seed(config.seed)
 
-    results = {}
+    from data_collection import collect_trajectory, process_trajectory
 
-    if config.experiment.task == "dynamics_learning":
-        model, train_results = train_dynamics_model(config)
-        results["dynamics"] = train_results
+    if not hasattr(config.experiment, 'env_name') or config.experiment.env_name is None:
+        raise ValueError("experiment.env_name must be set.")
 
-    elif config.experiment.task == "clf_training":
-        dynamics_model = None
-        if "dynamics_model_path" in config.experiment and config.experiment.dynamics_model_path:
-            print(f"Loading dynamics model from {config.experiment.dynamics_model_path}")
-            dynamics_model = DynamicsEnsemble.load_checkpoint(config.experiment.dynamics_model_path)
-            dynamics_model.eval()
+    env = gym.make(config.experiment.env_name)
+    state_dim = get_space_dimension(env.observation_space)
+    action_dim = get_space_dimension(env.action_space)
+    action_low = float(env.action_space.low.min())
+    action_high = float(env.action_space.high.max())
+    print(f"Environment: {config.experiment.env_name}  "
+          f"state_dim={state_dim}  action_dim={action_dim}  "
+          f"action_limits=({action_low}, {action_high})")
 
-        clf_model, train_results = train_clf_model(config, dynamics_model)
-        results["clf"] = train_results
+    data_cfg = config.experiment.data
+    num_trajectories        = int(data_cfg.get('num_trajectories', 5))
+    traj_length             = int(data_cfg.get('traj_length', 50))
+    buffer_size             = int(data_cfg.get('buffer_size', 3))
+    epochs_per_update       = int(data_cfg.get('epochs_per_trajectory', 5))
+    trajectories_per_update = int(data_cfg.get('trajectories_per_update', 1))
+    train_cfg = config.experiment.training
+    batch_size        = int(train_cfg.get("batch_size", config.training.batch_size))
+    log_every_n_steps = int(train_cfg.get("log_every_n_steps", 2))
 
-        if dynamics_model is not None and config.experiment.get("evaluate_control", False):
-            eval_results = evaluate_control_policy(config, clf_model, dynamics_model)
-            results["control_evaluation"] = eval_results
+    device = _get_device(config.device.accelerator, config.device.devices)
+    trajectory_buffer: List = []
+    dynamics_model = None
+    clf_model = None
 
-    elif config.experiment.task == "full_pipeline":
-        env = None
-        if hasattr(config.experiment, 'env_name') and config.experiment.env_name is not None:
-            from data_collection import collect_trajectory, process_trajectory
-            print(f"Setting up environment: {config.experiment.env_name}")
-            env = gym.make(config.experiment.env_name)
-            action_low = float(env.action_space.low.min())
-            action_high = float(env.action_space.high.max())
-        else:
-            raise ValueError("Environment name must be provided for full pipeline")
+    dynamics_run = _init_wandb_run(
+        config,
+        name=f"{config.logger.name}_dynamics",
+        extra_tags=["dynamics"],
+        notes=f"{config.logger.notes} - Dynamics",
+    )
+    clf_run = _init_wandb_run(
+        config,
+        name=f"{config.logger.name}_clf",
+        extra_tags=["clf"],
+        notes=f"{config.logger.notes} - CLF",
+    )
 
-        num_trajectories = config.experiment.data.get('num_trajectories', 5)
-        traj_length = config.experiment.data.get('traj_length', 50)
-        buffer_size = config.experiment.data.get('buffer_size', 3)
-        epochs_per_trajectory = config.experiment.data.get('epochs_per_trajectory', 5)
-        batch_size = config.experiment.training.get("batch_size", config.training.batch_size)
-        log_every_n_steps = config.experiment.training.get("log_every_n_steps", 2)
+    dynamics_epochs_trained = 0
+    clf_epochs_trained = 0
+    dynamics_trainer = None
+    clf_trainer = None
+    dynamics_dm = None
+    clf_dm = None
 
-        device = _get_device(config.device.accelerator, config.device.devices)
-        trajectory_buffer = []
-        dynamics_model = None
-        clf_model = None
+    traj_collected = 0
+    update_idx = 0
 
-        dynamics_run = _init_wandb_run(
-            config,
-            name=f"{config.logger.name}_dynamics",
-            extra_tags=["dynamics"],
-            notes=f"{config.logger.notes} - Dynamics",
-        )
-        clf_run = _init_wandb_run(
-            config,
-            name=f"{config.logger.name}_clf",
-            extra_tags=["clf"],
-            notes=f"{config.logger.notes} - CLF",
-        )
-
-        dynamics_epochs_trained = 0
-        clf_epochs_trained = 0
-        dynamics_trainer = None
-        clf_trainer = None
-
-        for traj_idx in range(num_trajectories):
-            print(f"\n=== Collecting trajectory {traj_idx+1}/{num_trajectories} ===")
-            new_trajectory = collect_trajectory(env, length=traj_length, random_seed=config.seed + traj_idx)
-            trajectory_buffer.append(new_trajectory)
+    while traj_collected < num_trajectories:
+        # ── Collect a batch of trajectories ──────────────────────────────────
+        to_collect = min(trajectories_per_update, num_trajectories - traj_collected)
+        for i in range(to_collect):
+            print(f"\n=== Collecting trajectory {traj_collected + 1}/{num_trajectories} ===")
+            traj = collect_trajectory(
+                env, length=traj_length, random_seed=config.seed + traj_collected
+            )
+            trajectory_buffer.append(traj)
             if len(trajectory_buffer) > buffer_size:
                 trajectory_buffer.pop(0)
-            states, actions, next_states = process_trajectory(trajectory_buffer)
-            print(f"Dataset size after trajectory {traj_idx+1}: {states.shape[0]} samples")
+            traj_collected += 1
 
-            # ── Dynamics training ────────────────────────────────────────────
-            dynamics_data_module = DynamicsDataModule(
-                states=states, actions=actions, next_states=next_states,
-                batch_size=batch_size,
-                num_workers=config.experiment.training.get("num_workers", 4),
-                normalize=config.experiment.dynamics.get("normalize_data", True),
-                random_seed=config.seed,
-                persistent_workers=config.experiment.data.get("persistent_workers", False),
-                train_ratio=config.experiment.data.get("train_ratio", 0.8),
-                val_ratio=config.experiment.data.get("val_ratio", 0.1),
-                test_ratio=config.experiment.data.get("test_ratio", 0.1),
+        states, actions, next_states = process_trajectory(trajectory_buffer)
+        print(f"Dataset size: {states.shape[0]} samples  "
+              f"(update {update_idx + 1}, buffer {len(trajectory_buffer)}/{buffer_size})")
+
+        # ── Dynamics update ───────────────────────────────────────────────────
+        dynamics_dm = DynamicsDataModule(
+            states=states, actions=actions, next_states=next_states,
+            batch_size=batch_size,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            normalize=config.experiment.dynamics.get("normalize_data", True),
+            random_seed=config.seed,
+            persistent_workers=data_cfg.get("persistent_workers", False),
+            train_ratio=data_cfg.get("train_ratio", 0.8),
+            val_ratio=data_cfg.get("val_ratio", 0.1),
+            test_ratio=data_cfg.get("test_ratio", 0.1),
+        )
+        dynamics_dm.prepare_data()
+        dynamics_dm.setup()
+
+        if dynamics_model is None:
+            dynamics_config = OmegaConf.to_container(config.model, resolve=True)
+            dynamics_config.update({"state_dim": state_dim, "action_dim": action_dim})
+            dynamics_model = hydra.utils.instantiate(OmegaConf.create(dynamics_config))
+            dynamics_run.config.update({
+                "state_dim": state_dim,
+                "action_dim": action_dim,
+                "epochs_per_update": epochs_per_update,
+                "buffer_size": buffer_size,
+                "trajectories_per_update": trajectories_per_update,
+            })
+
+        dynamics_trainer = _make_trainer(
+            config,
+            max_epochs=dynamics_epochs_trained + epochs_per_update,
+            min_epochs=dynamics_epochs_trained + 1,
+            wandb_run=dynamics_run,
+            log_every_n_steps=log_every_n_steps,
+            device=device,
+        )
+        print(f"Training dynamics for {epochs_per_update} epochs (update {update_idx + 1})...")
+        dynamics_trainer.fit(dynamics_model, dynamics_dm)
+        dynamics_epochs_trained += epochs_per_update
+
+        # ── CLF update ────────────────────────────────────────────────────────
+        clf_dm = CLFDataModule(
+            states=states, next_states=next_states,
+            batch_size=batch_size,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            normalize=config.experiment.dynamics.get("normalize_data", True),
+            random_seed=config.seed,
+            persistent_workers=data_cfg.get("persistent_workers", False),
+            train_ratio=data_cfg.get("train_ratio", 0.8),
+            val_ratio=data_cfg.get("val_ratio", 0.1),
+            test_ratio=data_cfg.get("test_ratio", 0.1),
+        )
+        clf_dm.prepare_data()
+        clf_dm.setup()
+
+        if clf_model is None:
+            clf_exp = getattr(config.experiment, "clf", OmegaConf.create({}))
+            exp_const = float(getattr(clf_exp, "exp_const", 1.0))
+            loss_cfg = (
+                OmegaConf.to_container(clf_exp.loss, resolve=True)
+                if hasattr(clf_exp, "loss") else None
             )
-            dynamics_data_module.prepare_data()
-            dynamics_data_module.setup()
-
-            if dynamics_model is None:
-                if env is not None:
-                    state_dim = get_space_dimension(env.observation_space)
-                    action_dim = get_space_dimension(env.action_space)
-                else:
-                    batch = next(iter(dynamics_data_module.train_dataloader()))
-                    state_dim = batch["states"].shape[1]
-                    action_dim = batch["actions"].shape[1]
-
-                dynamics_config = OmegaConf.to_container(config.model, resolve=True)
-                dynamics_config.update({"state_dim": state_dim, "action_dim": action_dim})
-                dynamics_model = hydra.utils.instantiate(OmegaConf.create(dynamics_config))
-
-                dynamics_run.config.update({
-                    "state_dim": state_dim, "action_dim": action_dim,
-                    "epochs_per_trajectory": epochs_per_trajectory,
-                    "buffer_size": buffer_size,
-                })
-                print(f"Inferred dimensions: state_dim={state_dim}, action_dim={action_dim}")
-
-            dynamics_trainer = _make_trainer(
-                config,
-                max_epochs=dynamics_epochs_trained + epochs_per_trajectory,
-                min_epochs=dynamics_epochs_trained + 1,
-                wandb_run=dynamics_run,
-                log_every_n_steps=log_every_n_steps,
-                device=device,
+            clf_config = {
+                "_target_": "src.models.clf.CLFNetwork",
+                "state_dim": state_dim,
+                "hidden_dim": int(getattr(clf_exp, "hidden_dim", 64)),
+                "dropout_rate": 0.1,
+                "learning_rate": 0.001,
+                "exp_const": exp_const,
+                "loss": loss_cfg,
+            }
+            clf_model = hydra.utils.instantiate(OmegaConf.create(clf_config))
+            qp_solver = CLFQPSolver(
+                action_dim=action_dim,
+                action_limits=(action_low, action_high),
+                exp_const=exp_const,
             )
-            print(f"Training dynamics model for {epochs_per_trajectory} epochs on trajectory {traj_idx+1}")
-            dynamics_trainer.fit(dynamics_model, dynamics_data_module)
-            dynamics_epochs_trained += epochs_per_trajectory
+            # Use object.__setattr__ to bypass nn.Module's __setattr__, so that
+            # dynamics_model and qp_solver are NOT registered as submodules.
+            # This keeps clf_model.parameters() and state_dict() clean (CLF only).
+            object.__setattr__(clf_model, 'dynamics_model', dynamics_model)
+            object.__setattr__(clf_model, 'qp_solver', qp_solver)
+            try:
+                from pendulum_utils import get_pendulum_equilibrium
+                clf_model.equilibrium.copy_(get_pendulum_equilibrium())
+            except Exception:
+                pass
+            clf_run.config.update(clf_config)
+        else:
+            # Re-point CLF at the freshly updated dynamics model each round.
+            object.__setattr__(clf_model, 'dynamics_model', dynamics_model)
 
-            # ── CLF training ─────────────────────────────────────────────────
-            clf_data_module = CLFDataModule(
-                states=states,
-                batch_size=batch_size,
-                num_workers=config.experiment.training.get("num_workers", 4),
-                normalize=config.experiment.dynamics.get("normalize_data", True),
-                random_seed=config.seed,
-                persistent_workers=config.experiment.data.get("persistent_workers", False),
-                train_ratio=config.experiment.data.get("train_ratio", 0.8),
-                val_ratio=config.experiment.data.get("val_ratio", 0.1),
-                test_ratio=config.experiment.data.get("test_ratio", 0.1),
-            )
-            clf_data_module.prepare_data()
-            clf_data_module.setup()
+        clf_trainer = _make_trainer(
+            config,
+            max_epochs=clf_epochs_trained + epochs_per_update,
+            min_epochs=clf_epochs_trained + 1,
+            wandb_run=clf_run,
+            log_every_n_steps=log_every_n_steps,
+            device=device,
+        )
+        print(f"Training CLF for {epochs_per_update} epochs (update {update_idx + 1})...")
+        clf_trainer.fit(clf_model, clf_dm)
+        clf_epochs_trained += epochs_per_update
 
-            if clf_model is None:
-                clf_config_dict = {
-                    "_target_": "src.models.clf.CLFNetwork",
-                    "state_dim": state_dim,
-                    "hidden_dim": config.experiment.clf.get("hidden_dim", 64),
-                    "dropout_rate": 0.1,
-                    "learning_rate": 0.001,
-                    "exp_const": float(config.experiment.clf.get("exp_const", 1.0)),
-                }
-                clf_model = hydra.utils.instantiate(OmegaConf.create(clf_config_dict))
-                clf_model.dynamics_model = dynamics_model
-                clf_model.qp_solver = CLFQPSolver(
-                    action_dim=action_dim,
-                    action_limits=(action_low, action_high),
-                    exp_const=float(config.experiment.clf.get("exp_const", 1.0)),
-                )
-                if hasattr(clf_model, 'equilibrium'):
-                    try:
-                        from pendulum_utils import get_pendulum_equilibrium
-                        clf_model.equilibrium.copy_(get_pendulum_equilibrium())
-                    except Exception:
-                        pass
-                clf_run.config.update(clf_config_dict)
+        dynamics_run.log({
+            "update": update_idx + 1,
+            "trajectories_collected": traj_collected,
+            "dynamics_epochs_trained": dynamics_epochs_trained,
+        })
+        clf_run.log({
+            "update": update_idx + 1,
+            "trajectories_collected": traj_collected,
+            "clf_epochs_trained": clf_epochs_trained,
+        })
+        update_idx += 1
 
-            clf_trainer = _make_trainer(
-                config,
-                max_epochs=clf_epochs_trained + epochs_per_trajectory,
-                min_epochs=clf_epochs_trained + 1,
-                wandb_run=clf_run,
-                log_every_n_steps=log_every_n_steps,
-                inference_mode=False,
-                device=device,
-            )
-            print(f"Training CLF model for {epochs_per_trajectory} epochs on trajectory {traj_idx+1}")
-            clf_trainer.fit(clf_model, clf_data_module)
-            clf_epochs_trained += epochs_per_trajectory
+    # ── Final test ─────────────────────────────────────────────────────────────
+    print("\n=== Testing final dynamics model ===")
+    dynamics_test_results = dynamics_trainer.test(dynamics_model, dynamics_dm) if dynamics_trainer else []
 
-            dynamics_run.log({"trajectory_completed": traj_idx + 1, "total_epochs_trained": dynamics_epochs_trained})
-            clf_run.log({"trajectory_completed": traj_idx + 1, "total_epochs_trained": clf_epochs_trained})
+    print("\n=== Testing final CLF model ===")
+    clf_test_results = clf_trainer.test(clf_model, clf_dm) if clf_trainer else []
 
-        # Test final models
-        print("\n=== Testing final dynamics model ===")
-        dynamics_test_results = dynamics_trainer.test(dynamics_model, dynamics_data_module) if dynamics_trainer else []
+    results: Dict[str, Any] = {
+        "dynamics": {"test_results": dynamics_test_results},
+        "clf": {"test_results": clf_test_results},
+    }
 
-        print("\n=== Testing final CLF model ===")
-        clf_test_results = clf_trainer.test(clf_model, clf_data_module) if clf_trainer else []
+    if dynamics_trainer and dynamics_trainer.best_model_path:
+        print(f"Best dynamics model path: {dynamics_trainer.best_model_path}")
+        dynamics_run.summary.update({"best_model_path": dynamics_trainer.best_model_path})
+        results["dynamics"]["best_model_path"] = dynamics_trainer.best_model_path
 
-        if config.experiment.get("evaluate_control", False):
-            print("\n=== Evaluating control policy ===")
-            eval_results = evaluate_control_policy(config, clf_model, dynamics_model)
-            results["control_evaluation"] = eval_results
+    if clf_trainer and clf_trainer.best_model_path:
+        print(f"Best CLF model path: {clf_trainer.best_model_path}")
+        clf_run.summary.update({"best_model_path": clf_trainer.best_model_path})
+        results["clf"]["best_model_path"] = clf_trainer.best_model_path
 
-        results["dynamics"] = {"test_results": dynamics_test_results}
-        results["clf"] = {"test_results": clf_test_results}
+    if config.experiment.get("evaluate_control", False):
+        print("\n=== Evaluating control policy ===")
+        results["control_evaluation"] = evaluate_control_policy(config, clf_model, dynamics_model)
 
-        if dynamics_trainer and dynamics_trainer.best_model_path:
-            print(f"Best dynamics model path: {dynamics_trainer.best_model_path}")
-            dynamics_run.summary.update({"best_model_path": dynamics_trainer.best_model_path})
-            results["dynamics"]["best_model_path"] = dynamics_trainer.best_model_path
-
-        if clf_trainer and clf_trainer.best_model_path:
-            print(f"Best CLF model path: {clf_trainer.best_model_path}")
-            clf_run.summary.update({"best_model_path": clf_trainer.best_model_path})
-            results["clf"]["best_model_path"] = clf_trainer.best_model_path
-
-        dynamics_run.finish()
-        clf_run.finish()
-
-        if env is not None:
-            env.close()
-
-    else:
-        raise ValueError(f"Unknown task: {config.experiment.task}")
+    dynamics_run.finish()
+    clf_run.finish()
+    env.close()
 
     return results
 
 
 if __name__ == "__main__":
     main()
+

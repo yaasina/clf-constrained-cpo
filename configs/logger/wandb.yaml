@@ -1,20 +1,9 @@
-# Weights & Biases Logger Configuration
-_target_: pytorch_lightning.loggers.WandbLogger
+# Weights & Biases run configuration
+# These values are read by _init_wandb_run() in training.py (via wandb.init directly)
 project: "clf-constrained-cpo"
 name: ${experiment.name}
 save_dir: ${hydra:runtime.output_dir}/logs
-log_model: false
 notes: ${experiment.description}
-tags: ["${experiment.task}"]
+tags: ["pipeline"]
 group: ${experiment.name}
 offline: false
-job_type: "train"
-reinit: true  # Ensures proper reinitialization for multiple runs
-settings:
-  start_method: "thread"  # Uses the newer service mode
-config:
-  experiment: ${experiment}
-  model: ${model}
-  optimizer: ${optimizer}
-  seed: ${seed}
-  training: ${training}

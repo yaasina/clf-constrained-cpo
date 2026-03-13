@@ -165,12 +165,13 @@ class DynamicsDataset(Dataset):
 
 class CLFDataset(Dataset):
     """
-    Dataset for CLF learning containing states.
+    Dataset for CLF learning containing states (and optionally next_states).
     """
 
     def __init__(
         self,
         states: torch.Tensor,
+        next_states: Optional[torch.Tensor] = None,
         normalize: bool = False
     ) -> None:
         """
@@ -181,6 +182,7 @@ class CLFDataset(Dataset):
             normalize: Whether to normalize the data
         """
         self.states = states
+        self.next_states = next_states
 
         # Compute normalization statistics if needed
         if normalize:
@@ -204,10 +206,9 @@ class CLFDataset(Dataset):
         Returns:
             Dictionary containing states (the dynamics model is stored at the dataset level)
         """
-        sample = {
-            "states": self.states[idx]
-        }
-            
+        sample = {"states": self.states[idx]}
+        if self.next_states is not None:
+            sample["next_states"] = self.next_states[idx]
         return sample
     
     def normalize_data(self) -> None:
@@ -472,6 +473,7 @@ class CLFDataModule:
     def __init__(
         self,
         states: torch.Tensor = None,
+        next_states: Optional[torch.Tensor] = None,
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
@@ -499,6 +501,7 @@ class CLFDataModule:
         """
 
         self.states = states
+        self.next_states = next_states
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
@@ -566,6 +569,10 @@ class CLFDataModule:
         val_s = self.states[val_idx]
         test_s = self.states[test_idx]
 
+        train_ns = self.next_states[train_idx] if self.next_states is not None else None
+        val_ns = self.next_states[val_idx] if self.next_states is not None else None
+        test_ns = self.next_states[test_idx] if self.next_states is not None else None
+
         # Optional normalisation — stats from training data only
         if self.normalize:
             s_mean = train_s.mean(dim=0, keepdim=True)
@@ -577,13 +584,18 @@ class CLFDataModule:
             train_s = (train_s - s_mean) / s_std
             val_s = (val_s - s_mean) / s_std
             test_s = (test_s - s_mean) / s_std
+
+            if train_ns is not None:
+                train_ns = (train_ns - s_mean) / s_std
+                val_ns = (val_ns - s_mean) / s_std
+                test_ns = (test_ns - s_mean) / s_std
         else:
             self.normalization_stats = {"state_mean": None, "state_std": None}
 
         # Build three separate Dataset objects
-        self.train_dataset = CLFDataset(train_s, normalize=False)
-        self.val_dataset = CLFDataset(val_s, normalize=False)
-        self.test_dataset = CLFDataset(test_s, normalize=False)
+        self.train_dataset = CLFDataset(train_s, next_states=train_ns, normalize=False)
+        self.val_dataset = CLFDataset(val_s, next_states=val_ns, normalize=False)
+        self.test_dataset = CLFDataset(test_s, next_states=test_ns, normalize=False)
     
     def train_dataloader(self) -> DataLoader:
         """Return the training dataloader."""

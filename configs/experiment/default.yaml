@@ -1,41 +1,49 @@
 # Default experiment configuration
 name: default_experiment
-description: "Default experiment configuration for CLF training on Pendulum-v1"
-task: clf_training  # Options: dynamics_learning, clf_training
+description: "CLF-CPO training on Pendulum-v1"
 
-# Environment settings
-env_name: "Pendulum-v1"  # Pendulum environment for CLF training data collection
+env_name: "Pendulum-v1"
 
-# Data configuration
+# Data / trajectory collection
 data:
   train_ratio: 0.8
   val_ratio: 0.1
   test_ratio: 0.1
   random_seed: ${seed}
-  num_trajectories: 10     # Default number of trajectories to collect
-  traj_length: 100         # Default length of each trajectory
-  buffer_size: 10          # Default buffer size (keep all trajectories by default)
-  epochs_per_trajectory: 5 # Default epochs to train on each trajectory
-  persistent_workers: true # Use persistent workers for faster data loading
+  num_trajectories: 10        # Total trajectories to collect
+  traj_length: 100            # Steps per trajectory
+  buffer_size: 10             # Rolling window size (FIFO)
+  trajectories_per_update: 1  # Collect N trajectories before each dynamics+CLF update
+  epochs_per_trajectory: 5    # Epochs to train on each update
+  persistent_workers: true
 
-# Dynamics-specific settings
+# Dynamics model settings
 dynamics:
-  dt: 0.05  # Time step for discrete integration
+  dt: 0.05
   normalize_data: true
-  # Default variance normalization parameters
-  static_norm_k: 1.0       # Scaling parameter for static normalization: 1-exp(-k*var)
-  dynamic_norm_c0: 0.1     # Initial value for dynamic normalization parameter
-  dynamic_norm_alpha: 0.01 # Learning rate for dynamic normalization parameter update
-  variance_buffer_size: 1000 # Size of the buffer for variance history
+  static_norm_k: 1.0
+  dynamic_norm_c0: 0.1
+  dynamic_norm_alpha: 0.01
+  variance_buffer_size: 1000
 
-# Training overrides
-training:
-  log_every_n_steps: 4     # Default log frequency for per-trajectory progress
-
-# CLF-specific settings (used when task is clf_training)
+# CLF settings
 clf:
-  lambda_param: 1.0  # Weight on the relaxation variable
-  exp_const: 1.0     # Exponential constant for CLF decrease rate
+  hidden_dim: 64
+  exp_const: 1.0
+  loss:
+    alpha1: 100.0   # V(equilibrium) = 0
+    alpha2: 1000.0  # Minimize QP relaxation
+    alpha3: 10.0    # CLF decrease condition
+    alpha4: 10.0    # Temporal decrease
   qp_solver:
     max_retries: 3
     verbose: false
+
+# Training overrides
+training:
+  log_every_n_steps: 4
+
+# Evaluation
+evaluate_control: false
+eval_grid: false
+n_eval_samples: 1000

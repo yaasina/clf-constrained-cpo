@@ -1,5 +1,5 @@
 # CLF Network Model Configuration
-_target_: src.models.clf.CLFNetworkLightning
+_target_: src.models.clf.CLFNetwork
 # Dimensions will be inferred from data during training
 hidden_dim: 64
 dropout_rate: 0.1

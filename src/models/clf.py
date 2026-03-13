@@ -4,8 +4,7 @@ Module for Control Lyapunov Function (CLF) models.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, List, Dict, Any, Optional, Union
+from typing import Tuple, List, Dict, Any, Optional
 import numpy as np
 import plotly.graph_objects as go
 
@@ -157,23 +156,6 @@ class CLFNetwork(nn.Module):
             )[0]
         return gradients
 
-    def _compute_gradient_fd(self, state: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
-        """Compute gradient using finite differences as a fallback."""
-        state_np = state.detach().cpu().numpy()
-        state_dim = state_np.shape[0]
-        gradient = np.zeros(state_dim)
-        base_state = torch.tensor(state_np, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            base_value = self.compute_clf(base_state).item()
-        for i in range(state_dim):
-            perturbed_state_np = state_np.copy()
-            perturbed_state_np[i] += epsilon
-            perturbed_state = torch.tensor(perturbed_state_np, dtype=torch.float32).unsqueeze(0)
-            with torch.no_grad():
-                perturbed_value = self.compute_clf(perturbed_state).item()
-            gradient[i] = (perturbed_value - base_value) / epsilon
-        return torch.tensor(gradient, dtype=torch.float32, device=state.device)
-
     def lie_derivatives(
         self,
         state: torch.Tensor,
@@ -244,57 +226,6 @@ class CLFNetwork(nn.Module):
         L_g_V_u = torch.sum(L_g_V * action, dim=1, keepdim=True)
         V = self.compute_clf(state)
         return L_f_V + L_g_V_u + self.exp_const * V
-
-    def compute_clf_loss(
-        self,
-        states: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-        epsilon: float = 1e-6
-    ) -> torch.Tensor:
-        clf_values = self.compute_clf(states)
-
-        if targets is not None:
-            loss = F.mse_loss(clf_values, targets)
-        else:
-            state_norms = torch.norm(states, dim=1, keepdim=True)
-            zero_mask = state_norms < epsilon
-            target_values = 0.5 * state_norms**2
-            target_values[zero_mask] = 0.0
-            loss = F.mse_loss(clf_values, target_values)
-            # Add penalty for negative CLF values to encourage non-negativity
-            negative_penalty = torch.relu(-clf_values).mean()
-            loss = loss + 10.0 * negative_penalty
-
-        return loss
-
-    def compute_lie_derivative_loss(
-        self,
-        states: torch.Tensor,
-        dynamics_model: nn.Module,
-        lambda_lie: float = 1.0,
-        epsilon: float = 1e-6
-    ) -> torch.Tensor:
-        # Mask points very close to the equilibrium
-        state_norms = torch.norm(states, dim=1, keepdim=True)
-        non_zero_mask = state_norms > epsilon
-
-        if not torch.any(non_zero_mask):
-            return torch.tensor(0.0, device=states.device, requires_grad=True)
-
-        L_f_V, L_g_V = self.lie_derivatives(states, dynamics_model)
-
-        L_g_V_norm = torch.norm(L_g_V, dim=1, keepdim=True)
-        # Normalize control direction without boolean indexing (R2)
-        u = -L_g_V / (L_g_V_norm + epsilon)
-
-        L_dot = L_f_V + torch.sum(L_g_V * u, dim=1, keepdim=True)
-
-        alpha = 0.1
-        clf_values = self.compute_clf(states)
-        desired_L_dot = -alpha * clf_values
-        lie_loss = torch.relu(L_dot - desired_L_dot).mean()
-
-        return lambda_lie * lie_loss
 
     def compute_self_supervised_clf_loss(
         self,
@@ -367,56 +298,38 @@ class CLFNetwork(nn.Module):
         batch: Dict[str, torch.Tensor],
         stage: str
     ) -> torch.Tensor:
-        """
-        Shared logic for training, validation, and test steps (R3).
-
-        Three tiers:
-          1. Both dynamics_model and qp_solver → full self-supervised CLF loss.
-          2. Only dynamics_model → CLF PD + Lie derivative loss.
-          3. Neither → basic CLF PD loss.
-        """
+        """Shared logic for training, validation, and test steps."""
         states = batch["states"]
+        next_states = batch.get("next_states", None)
+        dt = batch.get("dt", 0.05)
 
         dynamics_model = getattr(self, "dynamics_model", None)
         qp_solver = getattr(self, "qp_solver", None)
-
-        if dynamics_model is not None and qp_solver is not None:
-            next_states = batch.get("next_states", None)
-            dt = batch.get("dt", 0.05)
-
-            loss_dict = self.compute_self_supervised_clf_loss(
-                states=states,
-                dynamics_model=dynamics_model,
-                qp_solver=qp_solver,
-                next_states=next_states,
-                dt=dt,
-                alpha1=self.alpha1,
-                alpha2=self.alpha2,
-                alpha3=self.alpha3,
-                alpha4=self.alpha4 if next_states is not None else 0.0,
-                exp_const=self.exp_const,
+        if dynamics_model is None or qp_solver is None:
+            raise RuntimeError(
+                "CLFNetwork._shared_step requires both dynamics_model and qp_solver. "
+                "Set them via object.__setattr__(model, 'dynamics_model', ...) before training."
             )
-            total_loss = loss_dict["loss"]
-            self._log_metric(f"{stage}_loss", total_loss)
-            self._log_metric(f"{stage}_loss_equilibrium", loss_dict["loss_equilibrium"])
-            self._log_metric(f"{stage}_loss_relaxation", loss_dict["loss_relaxation"])
-            self._log_metric(f"{stage}_loss_lie_derivative", loss_dict["loss_lie_derivative"])
-            if next_states is not None:
-                self._log_metric(f"{stage}_loss_temporal", loss_dict["loss_temporal"])
 
-        elif dynamics_model is not None:
-            clf_loss = self.compute_clf_loss(states)
-            lie_loss = self.compute_lie_derivative_loss(states, dynamics_model)
-            total_loss = clf_loss + lie_loss
-            self._log_metric(f"{stage}_clf_loss", clf_loss)
-            self._log_metric(f"{stage}_lie_loss", lie_loss)
-            self._log_metric(f"{stage}_loss", total_loss)
-
-        else:
-            total_loss = self.compute_clf_loss(states)
-            self._log_metric(f"{stage}_clf_loss", total_loss)
-            self._log_metric(f"{stage}_loss", total_loss)
-
+        loss_dict = self.compute_self_supervised_clf_loss(
+            states=states,
+            dynamics_model=dynamics_model,
+            qp_solver=qp_solver,
+            next_states=next_states,
+            dt=dt,
+            alpha1=self.alpha1,
+            alpha2=self.alpha2,
+            alpha3=self.alpha3,
+            alpha4=self.alpha4 if next_states is not None else 0.0,
+            exp_const=self.exp_const,
+        )
+        total_loss = loss_dict["loss"]
+        self._log_metric(f"{stage}_loss", total_loss)
+        self._log_metric(f"{stage}_loss_equilibrium", loss_dict["loss_equilibrium"])
+        self._log_metric(f"{stage}_loss_relaxation", loss_dict["loss_relaxation"])
+        self._log_metric(f"{stage}_loss_lie_derivative", loss_dict["loss_lie_derivative"])
+        if next_states is not None:
+            self._log_metric(f"{stage}_loss_temporal", loss_dict["loss_temporal"])
         return total_loss
 
     def configure_optimizers(self) -> torch.optim.Optimizer:

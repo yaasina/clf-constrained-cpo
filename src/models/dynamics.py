@@ -383,6 +383,13 @@ class DynamicsEnsemble(nn.Module):
             loss = self.compute_loss(states, actions, next_states)
             self._log_metric("train_loss", loss)
             self._log_metric("train_dynamics_loss", loss)
+
+            # Ensemble disagreement: std of next-state predictions across members
+            with torch.no_grad():
+                individual = self.predict_next_state(states, actions, return_individual=True)
+                stacked = torch.stack(individual)  # [ensemble_size, batch, state_dim]
+                disagreement = stacked.std(dim=0).mean()
+            self._log_metric("train_ensemble_disagreement", disagreement)
         else:
             loss = torch.tensor(0.0, device=states.device, requires_grad=True)
             self._log_metric("train_loss", loss)
@@ -454,6 +461,10 @@ class DynamicsEnsemble(nn.Module):
                 }, step=self.global_step)
 
             print(f"Starting trajectory {self.trajectory_counter + 1} at epoch {self.current_epoch}")
+
+    def on_train_epoch_end(self) -> None:
+        """Log dynamic normalization parameter at the end of each training epoch."""
+        self._log_metric("dynamic_norm_parameter_c", self.dynamic_norm_c)
 
     def _log_predictions_wandb(
         self,
