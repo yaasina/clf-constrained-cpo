@@ -5,7 +5,6 @@ Data module for loading and processing datasets for dynamics learning and CLF tr
 import torch
 import numpy as np
 from typing import Tuple, List, Dict, Any, Optional, Union
-import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -259,9 +258,9 @@ class CLFDataset(Dataset):
         }
 
 
-class DynamicsDataModule(pl.LightningDataModule):
+class DynamicsDataModule:
     """
-    PyTorch Lightning data module for dynamics learning.
+    Data module for dynamics learning.
     Handles data loading, splitting, normalization, and batch preparation.
     """
     
@@ -283,7 +282,7 @@ class DynamicsDataModule(pl.LightningDataModule):
     ) -> None:
         """
         Initialize the data module.
-        
+
         Args:
             states: Tensor of states [n_samples, state_dim]
             actions: Tensor of actions [n_samples, action_dim]
@@ -299,7 +298,6 @@ class DynamicsDataModule(pl.LightningDataModule):
             data_path: Optional path to load data from (instead of using provided tensors)
             persistent_workers: Whether to keep worker processes alive between batches
         """
-        super().__init__()
         
         self.states = states
         self.actions = actions
@@ -465,9 +463,9 @@ class DynamicsDataModule(pl.LightningDataModule):
         return self.normalization_stats if hasattr(self, "normalization_stats") else {}
 
 
-class CLFDataModule(pl.LightningDataModule):
+class CLFDataModule:
     """
-    PyTorch Lightning data module for CLF learning.
+    Data module for CLF learning.
     Handles data loading, splitting, normalization, and batch preparation.
     """
 
@@ -499,7 +497,6 @@ class CLFDataModule(pl.LightningDataModule):
             data_path: Optional path to load data from (instead of using provided tensors)
             persistent_workers: Whether to keep worker processes alive between batches
         """
-        super().__init__()
 
         self.states = states
         self.train_ratio = train_ratio
