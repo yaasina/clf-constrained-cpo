@@ -7,9 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, List, Dict, Any, Optional, Union
 import numpy as np
-import wandb
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 
 class CLFNetwork(nn.Module):
@@ -446,28 +444,6 @@ class CLFNetwork(nn.Module):
 
     # ── Training hooks ──────────────────────────────────────────────────────────
 
-    def on_train_start(self) -> None:
-        """Called when training begins. Initialize visualization grid."""
-        self.equilibrium_values = []
-        self.global_steps = []
-
-        # Default to Pendulum environment
-        env_name = 'Pendulum-v1'
-
-        device = next(self.parameters()).device
-        self.grid_states, self.grid_info = None, None
-
-        try:
-            from src.utils.clf_visualizations import create_state_grid_from_env
-            self.grid_states, self.grid_info = create_state_grid_from_env(
-                env_name=env_name,
-                resolution=50,
-                device=device
-            )
-            print(f"Created visualization grid for {env_name} with shape {self.grid_states.shape}")
-        except Exception as e:
-            print(f"Failed to create visualization grid: {e}")
-
     def on_train_batch_end(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -507,22 +483,6 @@ class CLFNetwork(nn.Module):
             )
             self._wandb_run.log({"clf_equilibrium_history": fig}, step=self.global_step)
 
-    def on_train_epoch_end(self) -> None:
-        """Called at the end of each training epoch. Log CLF value grid contour."""
-        if not hasattr(self, 'grid_states') or self.grid_states is None:
-            return
-
-        try:
-            from src.utils.clf_visualizations import visualize_clf_value_grid
-            fig = visualize_clf_value_grid(self, self.grid_states, self.grid_info)
-            if self._wandb_run is not None:
-                self._wandb_run.log({"clf_value_contour": fig}, step=self.global_step)
-        except Exception as e:
-            print(f"Failed to generate CLF value contour: {e}")
-
-        if self.current_epoch % 5 == 0:
-            self._log_admissible_control_visualizations()
-
     # ── Visualization helpers ───────────────────────────────────────────────────
 
     def _log_clf_visualizations(self, states: torch.Tensor) -> None:
@@ -531,27 +491,6 @@ class CLFNetwork(nn.Module):
         with torch.enable_grad():
             # Detach for visualization only — no backprop needed (S3)
             clf_values = self.compute_clf(states).detach()
-
-            if self.state_dim == 2 and states.shape[0] >= 100:
-                try:
-                    grid_size = int(np.sqrt(states.shape[0]))
-                    if grid_size**2 == states.shape[0]:
-                        x = states[:, 0].cpu().numpy().reshape(grid_size, grid_size)
-                        y = states[:, 1].cpu().numpy().reshape(grid_size, grid_size)
-                        z = clf_values.cpu().numpy().reshape(grid_size, grid_size)
-                        fig = go.Figure(data=[go.Surface(z=z, x=x, y=y)])
-                        fig.update_layout(
-                            title="CLF Value Surface",
-                            scene=dict(
-                                xaxis_title="State Dimension 1",
-                                yaxis_title="State Dimension 2",
-                                zaxis_title="CLF Value"
-                            )
-                        )
-                        if self._wandb_run is not None:
-                            self._wandb_run.log({"clf_surface": fig}, step=self.global_step)
-                except Exception:
-                    pass
 
             state_norms = torch.norm(states, dim=1).cpu().numpy()
             clf_vals = clf_values.squeeze().cpu().numpy()
@@ -583,52 +522,6 @@ class CLFNetwork(nn.Module):
             )
             if self._wandb_run is not None:
                 self._wandb_run.log({"clf_vs_norm": fig}, step=self.global_step)
-
-            if self.state_dim == 2:
-                gradients = self.gradient(states)
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatter(
-                        x=states[:, 0].cpu().numpy(),
-                        y=states[:, 1].cpu().numpy(),
-                        mode="markers",
-                        marker=dict(
-                            size=8,
-                            color=clf_values.squeeze().cpu().numpy(),
-                            colorscale="Viridis",
-                            showscale=True,
-                            colorbar=dict(title="CLF Value")
-                        ),
-                        name="States"
-                    )
-                )
-                max_arrows = 50
-                if states.shape[0] > max_arrows:
-                    stride = states.shape[0] // max_arrows
-                    idx = np.arange(0, states.shape[0], stride)
-                else:
-                    idx = np.arange(states.shape[0])
-                grad_norms = torch.norm(gradients[idx], dim=1, keepdim=True)
-                max_norm = grad_norms.max().item()
-                normalized_gradients = gradients[idx] / max_norm if max_norm > 0 else gradients[idx]
-                fig.add_trace(
-                    go.Scatter(
-                        x=states[idx, 0].cpu().numpy(),
-                        y=states[idx, 1].cpu().numpy(),
-                        mode="markers+text",
-                        marker=dict(size=5, color="rgba(0,0,0,0)"),
-                        text=["↑" if g[1] > 0 else "↓" for g in normalized_gradients.detach().cpu().numpy()],
-                        textposition="top center",
-                        name="Gradient Direction"
-                    )
-                )
-                fig.update_layout(
-                    title="CLF Gradient Field",
-                    xaxis_title="State Dimension 1",
-                    yaxis_title="State Dimension 2"
-                )
-                if self._wandb_run is not None:
-                    self._wandb_run.log({"clf_gradient_field": fig}, step=self.global_step)
 
     def _log_lie_derivative_visualizations(self, states: torch.Tensor, dynamics_model: nn.Module) -> None:
         """Log Lie derivative visualizations to W&B."""
@@ -745,69 +638,6 @@ class CLFNetwork(nn.Module):
             )
             if self._wandb_run is not None:
                 self._wandb_run.log({"lie_derivative_total": fig}, step=self.global_step)
-
-    def _log_admissible_control_visualizations(self) -> None:
-        """Generate and log visualizations of the admissible control set."""
-        if not hasattr(self, 'grid_states') or self.grid_states is None:
-            return
-
-        # Skip expensive computation if there's nowhere to log
-        if self._wandb_run is None:
-            return
-
-        # Get dynamics model from self (was attached by training.py before fit)
-        dynamics_model = getattr(self, 'dynamics_model', None)
-        if dynamics_model is None:
-            print("No dynamics model available for admissible control visualization")
-            return
-
-        action_bounds = (-5.0, 5.0)
-        action_dim = 1
-
-        # Try to get action bounds from attached qp_solver
-        qp_solver = getattr(self, 'qp_solver', None)
-        if qp_solver is not None:
-            action_bounds = (qp_solver.action_lower, qp_solver.action_upper)
-            if qp_solver.action_dim is not None:
-                action_dim = qp_solver.action_dim
-
-        try:
-            from src.utils.clf_visualizations import visualize_admissible_control_set
-
-            fig, infimum_actions, lie_derivatives = visualize_admissible_control_set(
-                clf_model=self,
-                dynamics_model=dynamics_model,
-                grid_states=self.grid_states,
-                grid_info=self.grid_info,
-                action_bounds=action_bounds,
-                action_dim=action_dim,
-                resolution=100
-            )
-
-            if self._wandb_run is not None:
-                self._wandb_run.log({"admissible_control_set": fig}, step=self.global_step)
-
-                n_admissible = torch.sum(infimum_actions != float('inf')).item()
-                total_points = len(infimum_actions)
-                coverage = 100.0 * n_admissible / total_points
-
-                self._wandb_run.log({
-                    "admissible_control_coverage": coverage,
-                    "admissible_control_count": n_admissible,
-                }, step=self.global_step)
-
-                valid_actions = infimum_actions[infimum_actions != float('inf')].cpu().numpy()
-                if len(valid_actions) > 0:
-                    fig = go.Figure(data=go.Histogram(x=valid_actions, nbinsx=30))
-                    fig.update_layout(
-                        title="Distribution of Infimum Admissible Controls",
-                        xaxis_title="Control Value",
-                        yaxis_title="Count"
-                    )
-                    self._wandb_run.log({"admissible_control_histogram": fig}, step=self.global_step)
-
-        except Exception as e:
-            print(f"Failed to generate admissible control visualization: {e}")
 
     def save_checkpoint(self, path: str, val_loss: Optional[float] = None) -> None:
         """Save model to a checkpoint file."""
