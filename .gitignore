@@ -64,6 +64,10 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
+result*/
+src/result*/
+wandb*/
+src/wandb*/
 dynamics_results*/
 clf_results*/
 !dynamics_results/models/*.pt
@@ -79,6 +83,8 @@ data/*.npy
 data/*.npz
 data/*.hdf5
 data/*.h5
+*.npz
+*.png
 
 # Allow keeping empty directories with .gitkeep
 !.gitkeep

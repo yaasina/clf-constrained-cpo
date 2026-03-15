@@ -274,7 +274,7 @@ class CLFNetwork(nn.Module):
         if u_values.dim() == 1:
             u_values = u_values.unsqueeze(-1)
         L_dot = L_f_V + torch.sum(L_g_V * u_values, dim=1, keepdim=True) + exp_const * clf_values
-        loss_lie_derivative = alpha3 * torch.relu(L_dot).mean()
+        loss_lie_derivative = alpha3 * torch.relu(L_dot + 0.1).mean()
 
         # Term 4: temporal decrease (only if next_states provided)
         loss_temporal = torch.tensor(0.0, device=device)
@@ -282,8 +282,12 @@ class CLFNetwork(nn.Module):
             next_values = self.compute_clf(next_states)
             v_dot = (next_values - clf_values) / dt
             loss_temporal = alpha4 * torch.mean(torch.relu(v_dot))
+        
+        # Term 5: Regularize CLF scale to be close to state norm squared
+        state_norm_sq = torch.sum(states.pow(2), dim=1, keepdim=True)
+        loss_scaling = 0.01 * torch.mean((clf_values - state_norm_sq).pow(2))
 
-        total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal
+        total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal #+ loss_scaling
 
         return {
             "loss": total_loss,
@@ -291,6 +295,7 @@ class CLFNetwork(nn.Module):
             "loss_relaxation": loss_relaxation,
             "loss_lie_derivative": loss_lie_derivative,
             "loss_temporal": loss_temporal,
+            "loss_scaling": loss_scaling,
         }
 
     def _shared_step(

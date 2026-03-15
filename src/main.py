@@ -25,10 +25,14 @@ def train(main_args):
     max_steps = 4000
     epochs = 250
     save_freq = 10
-    seed = algo_idx + random.randint(0, 100)
+    seed = algo_idx + 18
     algo = '{}_{}'.format(agent_name, algo_idx)
     save_name = '_'.join(env_name.split('-')[:-1])
-    save_name = "result/{}_{}_{}".format(save_name, algo, seed)
+    if main_args["save_name"] is not None:
+        save_name = main_args["save_name"]
+    else:
+        save_name = "result/{}_{}_{}".format(save_name, algo, seed)
+    stop = False
     args = {
         'agent_name':agent_name,
         'save_name': save_name,
@@ -137,36 +141,44 @@ def train(main_args):
         "next_states": torch.as_tensor(next_states, device=device, dtype=torch.float32)
         }
 
+        # calculate costs
+        costs = torch.relu(clf.compute_lie_derivative_with_action(batch["states"], batch["actions"], dynamics)).detach().cpu().numpy()
+        cost_arr.append(costs)
+
         dyn_opt.zero_grad()
         dynamics.compute_loss(batch["states"], batch["actions"], batch["next_states"]).backward()
         dyn_opt.step()
 
         clf_opt.zero_grad()
-        clf.compute_self_supervised_clf_loss(
+        clf_losses = clf.compute_self_supervised_clf_loss(
             states=batch["states"], dynamics_model=dynamics, qp_solver=qp,
             next_states=batch["next_states"], dt=0.05,
             alpha1=clf.alpha1, alpha2=clf.alpha2, alpha3=clf.alpha3,
             alpha4=clf.alpha4, exp_const=clf.exp_const,
-        )["loss"].backward()
+        )
+        clf_total_loss = clf_losses["loss"]
+        clf_total_loss.backward()
         clf_opt.step()
-
-        # calculate costs
-        costs = clf.compute_lie_derivative_with_action(batch["states"], batch["actions"], dynamics).detach().cpu().numpy()
-        cost_arr.append(costs)
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
 
         v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories)
         score = np.mean(scores)
-        log_data = {"score":score, "value loss":v_loss, "cost value loss":cost_v_loss, "objective":objective, "cost surrogate":cost_surrogate, "kl":kl, "entropy":entropy}
+        log_data = {"Episode Reward":score, "Total Steps": global_step}
+        log_data = {**log_data, **clf_losses}
+
         print(log_data)
         wandb.log(log_data)
         if (epoch + 1)%save_freq == 0:
             agent.save()
+            clf.save_checkpoint(save_name + "/clf.pt")
+            dynamics.save_checkpoint(save_name + "/dynamics.pt")
             np.savez(save_name + "_costs.npz", cost_arr=cost_arr)
             np.savez(save_name + "_rewards.npz", rew_arr=rew_arr)
             np.savez(save_name + "_steps.npz", step_arr=step_arr)
+            if stop:
+                break
 
 
 
@@ -177,10 +189,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='CPO')
     parser.add_argument('--test', action='store_true', help='For test.')
     parser.add_argument('--resume', type=int, default=0, help='type # of checkpoint.')
-    parser.add_argument('--graph', action='store_true', help='For graph.')
+    parser.add_argument('--save_name', type=str, default=None, help='Name of base save directory')
     args = parser.parse_args()
     dict_args = vars(args)
     if args.test:
         test(args)
     else:
-        train(args)
+        train(dict_args)
