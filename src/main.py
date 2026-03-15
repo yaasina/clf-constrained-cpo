@@ -3,10 +3,10 @@ from models.dynamics import DynamicsEnsemble
 from models.clf import CLFNetwork
 from solvers.clf_qp_solver import CLFQPSolver
 
-from sklearn.utils import shuffle
-from collections import deque
-from scipy.stats import norm
-from copy import deepcopy
+# from sklearn.utils import shuffle
+# from collections import deque
+# from scipy.stats import norm
+# from copy import deepcopy
 import numpy as np
 import argparse
 import pickle
@@ -23,11 +23,12 @@ def train(main_args):
     env_name = "Pendulum-v1"
     max_ep_len = 1000
     max_steps = 4000
-    epochs = 2500
+    epochs = 250
     save_freq = 10
+    seed = algo_idx + random.randint(0, 100)
     algo = '{}_{}'.format(agent_name, algo_idx)
     save_name = '_'.join(env_name.split('-')[:-1])
-    save_name = "result/{}_{}".format(save_name, algo)
+    save_name = "result/{}_{}_{}".format(save_name, algo, seed)
     args = {
         'agent_name':agent_name,
         'save_name': save_name,
@@ -54,7 +55,6 @@ def train(main_args):
         print('[torch] cpu is used.')
 
     # for random seed
-    seed = algo_idx + random.randint(0, 100)
     np.random.seed(seed)
     random.seed(seed)
 
@@ -87,7 +87,11 @@ def train(main_args):
 
     # for wandb
     wandb.init(project='[torch] CPO')
-    
+    rew_arr = []
+    step_arr = []
+    cost_arr = []
+    global_step = 0
+
     for epoch in range(epochs):
         trajectories = []
         ep_step = 0
@@ -99,6 +103,8 @@ def train(main_args):
             while True:
                 ep_step += 1
                 step += 1
+                global_step += 1
+
                 state_tensor = torch.tensor(state, device=device, dtype=torch.float)
                 action_tensor, clipped_action_tensor = agent.getAction(state_tensor, is_train=True)
                 action = action_tensor.detach().cpu().numpy()
@@ -113,6 +119,9 @@ def train(main_args):
                 score += reward
 
                 if done or step >= max_ep_len:
+                    rew_arr.append(score)
+                    step_arr.append(global_step)
+
                     break
 
             scores.append(score)
@@ -143,6 +152,7 @@ def train(main_args):
 
         # calculate costs
         costs = clf.compute_lie_derivative_with_action(batch["states"], batch["actions"], dynamics).detach().cpu().numpy()
+        cost_arr.append(costs)
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
@@ -154,6 +164,10 @@ def train(main_args):
         wandb.log(log_data)
         if (epoch + 1)%save_freq == 0:
             agent.save()
+            np.savez(save_name + "_costs.npz", cost_arr=cost_arr)
+            np.savez(save_name + "_rewards.npz", rew_arr=rew_arr)
+            np.savez(save_name + "_steps.npz", step_arr=step_arr)
+
 
 
 def test(args):
