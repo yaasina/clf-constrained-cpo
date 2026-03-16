@@ -12,7 +12,14 @@ import plotly.graph_objects as go
 class CLFNetwork(nn.Module):
     """
     Neural network model for learning a Control Lyapunov Function (CLF).
-    The CLF is of the form V(x) = 0.5 * (NN(x))^2, which ensures V >= 0
+
+    V(x) = (x-x*)^T P (x-x*) + ||v_θ(x) - v_θ(x*)||²
+
+    P = A^T A + eps_pd * I  is positive definite by construction (A is a learnable
+    n×n matrix, eps_pd > 0), which prevents gradient collapse and ensures:
+      - V(x) > 0 for all x ≠ x*
+      - V(x*) = 0 exactly (no equilibrium loss term needed)
+      - ∇V has a quadratic lower bound, keeping Lie derivatives well-conditioned
     """
 
     def __init__(
@@ -26,9 +33,17 @@ class CLFNetwork(nn.Module):
         loss: Optional[Dict[str, float]] = None,
         equilibrium: Optional[torch.Tensor] = None,
         exp_const: float = 1.0,
+        eps_pd: float = 1e-2,
+        residual_dim: Optional[int] = None,
     ) -> None:
         """
         Initialize the CLF network.
+
+        V(x) = (x-x*)^T P (x-x*) + ||v_θ(x) - v_θ(x*)||²
+
+        P = A^T A + eps_pd * I  is positive definite by construction.
+        v_θ(x) is the vector output of the residual network (size residual_dim,
+        defaults to state_dim).
 
         Args:
             state_dim: Dimension of the state space
@@ -41,12 +56,16 @@ class CLFNetwork(nn.Module):
             equilibrium: Equilibrium state tensor [state_dim]. Defaults to the zero vector.
             exp_const: Exponential decay constant μ for the CLF condition
                        L_f_V + L_g_V·u + μ·V(x) ≤ 0 (must be positive for exponential stability).
+            eps_pd: Lower bound on eigenvalues of P (ensures strict positive definiteness).
+            residual_dim: Output dimension of v_θ(x). Defaults to state_dim if None.
         """
         super().__init__()
 
         self.state_dim = state_dim
+        self.residual_dim = residual_dim if residual_dim is not None else state_dim
         self.output_nonlinearity = output_nonlinearity
         self.learning_rate = learning_rate
+        self.eps_pd = eps_pd
 
         # Set loss hyperparameters with defaults
         self.loss_params = loss or {}
@@ -61,7 +80,10 @@ class CLFNetwork(nn.Module):
         _eq = equilibrium.clone().detach().float() if equilibrium is not None else torch.zeros(state_dim)
         self.register_buffer("equilibrium", _eq)
 
-        # Define neural network architecture with dropout
+        # Learnable n×n matrix for the quadratic term: P = A^T A + eps_pd * I
+        self.A = nn.Parameter(torch.randn(state_dim, state_dim) * 0.1)
+
+        # Residual network: outputs a residual_dim-dimensional vector v_θ(x)
         self.layers = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nonlinearity,
@@ -72,7 +94,7 @@ class CLFNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nonlinearity,
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, self.residual_dim)
         )
 
         # Tracking state for the custom training loop
@@ -91,6 +113,8 @@ class CLFNetwork(nn.Module):
             "dropout_rate": dropout_rate,
             "learning_rate": learning_rate,
             "exp_const": exp_const,
+            "eps_pd": eps_pd,
+            "residual_dim": self.residual_dim,
             "loss": loss,
         }
 
@@ -102,16 +126,14 @@ class CLFNetwork(nn.Module):
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass to compute NN(x).
+        Forward pass to compute v_θ(x), the residual vector.
 
         Args:
             state: Batch of state vectors [batch_size, state_dim]
 
         Returns:
-            Network output [batch_size, 1]
+            Residual vector [batch_size, state_dim]
         """
-
-
         output = self.layers(state)
 
         if self.output_nonlinearity is not None:
@@ -121,7 +143,11 @@ class CLFNetwork(nn.Module):
 
     def compute_clf(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Compute the CLF value V(x) = 0.5 * (NN(x))^2.
+        Compute the CLF value:
+            V(x) = (x-x*)^T P (x-x*) + ||v_θ(x) - v_θ(x*)||²
+
+        P = A^T A + eps_pd * I  is positive definite by construction,
+        so V(x) > 0 for all x ≠ x* and V(x*) = 0 exactly.
 
         Args:
             state: Batch of state vectors [batch_size, state_dim]
@@ -129,8 +155,22 @@ class CLFNetwork(nn.Module):
         Returns:
             CLF values [batch_size, 1]
         """
-        nn_output = self(state)
-        return 0.5 * torch.pow(nn_output, 2)
+        device = state.device
+        n = self.state_dim
+
+        # Quadratic term: (x - x*)^T P (x - x*)
+        P = self.A.T @ self.A + self.eps_pd * torch.eye(n, device=device, dtype=state.dtype)
+        deviation = state - self.equilibrium          # [B, n]
+        Pd = deviation @ P                            # [B, n]
+        quad = (Pd * deviation).sum(dim=1, keepdim=True)  # [B, 1]
+
+        # Residual term: ||v_θ(x) - v_θ(x*)||²
+        # v_eq is treated as constant w.r.t. state (equilibrium is a fixed buffer)
+        v_x = self(state)                                          # [B, n]
+        v_eq = self(self.equilibrium.unsqueeze(0))                 # [1, n]
+        residual = ((v_x - v_eq) ** 2).sum(dim=1, keepdim=True)   # [B, 1]
+
+        return quad + residual
 
     def gradient(self, state: torch.Tensor) -> torch.Tensor:
         """
@@ -374,13 +414,30 @@ class CLFNetwork(nn.Module):
         # Use the equilibrium buffer (L6 — no hard-coded import)
         equilibrium_state = self.equilibrium
 
+        # Temporarily switch to eval so gradient() uses create_graph=False (monitoring only)
+        self.eval()
         with torch.no_grad():
             equilibrium_value = self.compute_clf(equilibrium_state.unsqueeze(0)).item()
+
+        # Flatness monitors: mean CLF magnitude and mean gradient norm over the batch
+        states = batch.get("states")
+        if states is not None:
+            with torch.no_grad():
+                clf_vals = self.compute_clf(states)
+                clf_magnitude = clf_vals.mean().item()
+            grad_L = self.gradient(states)  # enable_grad is used internally; create_graph=False in eval
+            grad_norm_mean = torch.norm(grad_L.detach(), dim=1).mean().item()
+        else:
+            clf_magnitude = float("nan")
+            grad_norm_mean = float("nan")
+        self.train()
 
         self.equilibrium_values.append(equilibrium_value)
         self.global_steps.append(self.global_step)
 
         self._log_metric("clf_equilibrium_value", equilibrium_value)
+        self._log_metric("clf_magnitude_mean", clf_magnitude)
+        self._log_metric("clf_grad_norm_mean", grad_norm_mean)
 
         # Every 100 steps, log a plot of equilibrium value history
         if len(self.equilibrium_values) % 100 == 0 and self._wandb_run is not None:

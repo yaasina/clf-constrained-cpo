@@ -5,17 +5,19 @@ hidden_dim: 64
 dropout_rate: 0.1
 learning_rate: 0.001
 exp_const: 1.0  # Exponential decay constant μ for L_f_V + L_g_V·u + μ·V(x) ≤ 0
+eps_pd: 0.01    # Lower bound on eigenvalues of P = A^T A + eps_pd*I (strict positive definiteness)
+residual_dim: 16  # Output dim of v_θ(x); null defaults to state_dim
 
 # Self-supervised CLF loss hyperparameters
 loss:
-  # Weight for minimizing CLF value at equilibrium: α₁V_θ(0)
-  alpha1: 100.0
-  
+  # Weight for V(x*) = 0 penalty — analytically zero with new architecture, kept as sanity check
+  alpha1: 0
+
   # Weight for minimizing relaxation variables: (α₂/B)∑ᵢr_i
-  alpha2: 1000.0
-  
+  alpha2: 1.0
+
   # Weight for enforcing CLF condition: (α₃/B)∑ᵢmax(L_f V_θ(x_i) + L_g V_θ(x_i)u_i + μ·V_θ(x_i), 0)
-  alpha3: 10.0
-  
+  alpha3: 1.0
+
   # Weight for ensuring CLF decreases over time: (α₄/B)∑ᵢmax((V_θ(x_i⁺) - V_θ(x_i))/Δt, 0)
-  alpha4: 10.0
+  alpha4: 1.0

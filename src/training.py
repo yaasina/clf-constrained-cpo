@@ -513,6 +513,8 @@ def main(config: DictConfig) -> Dict[str, Any]:
         if clf_model is None:
             clf_exp = getattr(config.experiment, "clf", OmegaConf.create({}))
             exp_const = float(getattr(clf_exp, "exp_const", 1.0))
+            eps_pd = float(getattr(clf_exp, "eps_pd", 1e-2))
+            residual_dim = getattr(clf_exp, "residual_dim", None)
             loss_cfg = (
                 OmegaConf.to_container(clf_exp.loss, resolve=True)
                 if hasattr(clf_exp, "loss") else None
@@ -524,6 +526,8 @@ def main(config: DictConfig) -> Dict[str, Any]:
                 "dropout_rate": 0.1,
                 "learning_rate": 0.001,
                 "exp_const": exp_const,
+                "eps_pd": eps_pd,
+                "residual_dim": int(residual_dim) if residual_dim is not None else None,
                 "loss": loss_cfg,
             }
             clf_model = hydra.utils.instantiate(OmegaConf.create(clf_config))

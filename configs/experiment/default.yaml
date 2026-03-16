@@ -31,10 +31,10 @@ clf:
   hidden_dim: 64
   exp_const: 1.0
   loss:
-    alpha1: 100.0   # V(equilibrium) = 0
-    alpha2: 1000.0  # Minimize QP relaxation
-    alpha3: 10.0    # CLF decrease condition
-    alpha4: 10.0    # Temporal decrease
+    alpha1: 1.0   # V(equilibrium) = 0
+    alpha2: 1.0  # Minimize QP relaxation
+    alpha3: 1.0    # CLF decrease condition
+    alpha4: 1.0    # Temporal decrease
   qp_solver:
     max_retries: 3
     verbose: false
