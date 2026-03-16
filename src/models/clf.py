@@ -260,8 +260,8 @@ class CLFNetwork(nn.Module):
 
         # Solve QP for optimal controls and relaxation variables
         qp_results = qp_solver.solve_batch(states, self, dynamics_model, batch_size=batch_size)
-        u_values = qp_results['u_values']
-        r_values = qp_results['r_values']
+        u_values = qp_results['u_values'].to(device)
+        r_values = qp_results['r_values'].to(device)
 
         # Term 2: minimise relaxation variables; filter inf from failed QP solves (L7)
         valid_r = r_values[~torch.isinf(r_values)]
@@ -285,7 +285,7 @@ class CLFNetwork(nn.Module):
         
         # Term 5: Regularize CLF scale to be close to state norm squared
         state_norm_sq = torch.sum(states.pow(2), dim=1, keepdim=True)
-        loss_scaling = 0.01 * torch.mean((clf_values - state_norm_sq).pow(2))
+        loss_scaling = 0.1 * torch.mean((clf_values - state_norm_sq).pow(2))
 
         total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal + loss_scaling
 

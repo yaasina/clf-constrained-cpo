@@ -25,7 +25,7 @@ def train(main_args):
     max_steps = 4000
     epochs = 250
     save_freq = 10
-    seed = algo_idx + 18
+    seed = algo_idx + 55
     algo = '{}_{}'.format(agent_name, algo_idx)
     save_name = '_'.join(env_name.split('-')[:-1])
     if main_args["save_name"] is not None:
@@ -76,7 +76,7 @@ def train(main_args):
 
     clf = CLFNetwork(
         state_dim=env.observation_space.shape[0], hidden_dim=64, learning_rate=1e-3,
-        loss={"alpha1": 1.0, "alpha2": 0.1, "alpha3": 1.0, "alpha4": 1.0},
+        loss={"alpha1": 1.0, "alpha2": 1.0, "alpha3": 0.1, "alpha4": 0.1},
         equilibrium=equilibrium, exp_const=1.0,
     ).to(device)
 

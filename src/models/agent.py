@@ -83,7 +83,7 @@ class Agent:
         self.cost_value = Value(args).to(device)
         self.v_optimizer = torch.optim.Adam(self.value.parameters(), lr=self.v_lr)
         self.cost_v_optimizer = torch.optim.Adam(self.cost_value.parameters(), lr=self.cost_v_lr)
-        self.load()
+        # self.load()
 
 
     def normalizeAction(self, a:torch.Tensor) -> torch.Tensor:
@@ -355,6 +355,8 @@ class Agent:
         return x
     
     def save(self):
+        if not os.path.isdir(self.checkpoint_dir):
+            os.makedirs(self.checkpoint_dir)
         torch.save({
             'policy': self.policy.state_dict(),
             'value': self.value.state_dict(),

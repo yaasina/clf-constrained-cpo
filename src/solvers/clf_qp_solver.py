@@ -224,7 +224,7 @@ class CLFQPSolver(nn.Module):
                 V = V_batch[j].reshape(1, 1)
 
                 try:
-                    u, r = self.qp_layer(L_f_V, L_g_V, V)
+                    u, r = self.qp_layer(L_f_V.cpu(), L_g_V.cpu(), V.cpu())
                     failed = (
                         torch.isnan(u).any() or torch.isinf(u).any()
                         or torch.isnan(r).any() or torch.isinf(r).any()
