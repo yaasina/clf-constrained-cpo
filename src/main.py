@@ -142,13 +142,19 @@ def train(main_args):
         }
 
         # calculate costs
+        clf.eval()
+        dynamics.eval()
         costs = torch.relu(clf.compute_lie_derivative_with_action(batch["states"], batch["actions"], dynamics)).detach().cpu().numpy()
         cost_arr.append(costs)
 
+        dynamics.train()
         dyn_opt.zero_grad()
         dynamics.compute_loss(batch["states"], batch["actions"], batch["next_states"]).backward()
         dyn_opt.step()
 
+        # use dynamics in eval mode for training CLF
+        clf.train()
+        dynamics.eval()
         clf_opt.zero_grad()
         clf_losses = clf.compute_self_supervised_clf_loss(
             states=batch["states"], dynamics_model=dynamics, qp_solver=qp,
