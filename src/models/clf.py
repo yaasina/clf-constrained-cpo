@@ -327,7 +327,7 @@ class CLFNetwork(nn.Module):
         state_norm_sq = torch.sum(states.pow(2), dim=1, keepdim=True)
         loss_scaling = 0.1 * torch.mean((clf_values - state_norm_sq).pow(2))
 
-        total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal + loss_scaling
+        total_loss = loss_equilibrium + loss_relaxation + loss_lie_derivative + loss_temporal #+ loss_scaling
 
         return {
             "loss": total_loss,

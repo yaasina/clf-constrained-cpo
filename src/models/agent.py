@@ -143,7 +143,7 @@ class Agent:
         entropy = torch.mean(torch.sum(normal.entropy(), dim=1))
         return entropy
 
-    def train(self, trajs):
+    def train(self, trajs, uncert):
         # convert to numpy array
         states = np.array([traj[0] for traj in trajs])
         actions = np.array([traj[1] for traj in trajs])
@@ -214,6 +214,7 @@ class Agent:
             scalar_q = torch.dot(approx_g, x_value)
             scalar_r = torch.dot(approx_g, H_inv_b)
             scalar_s = torch.dot(approx_b, H_inv_b)
+            c_value = c_value + uncert*(c_value + np.sqrt(2*self.max_kl*scalar_s + EPS))
             A_value = scalar_q - scalar_r**2 / scalar_s # should be always positive (Cauchy-Shwarz)
             B_value = 2*self.max_kl - c_value**2 / scalar_s # does safety boundary intersect trust region? (positive = yes)
             if c_value < 0 and B_value < 0:
