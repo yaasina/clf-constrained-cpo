@@ -87,13 +87,8 @@ class CLFNetwork(nn.Module):
         self.layers = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nonlinearity,
-            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, hidden_dim),
             nonlinearity,
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim),
-            nonlinearity,
-            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, self.residual_dim)
         )
 
