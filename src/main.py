@@ -168,12 +168,11 @@ def train(main_args):
 
         raw_uncert = dynamics.compute_uncertainty(batch["states"], batch["actions"])
         uncert = dynamics.normalize_variance_dynamic(raw_uncert.mean()).detach()
-        print(uncert.shape)
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
 
-        v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
+        v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert.cpu())
         score = np.mean(scores)
         log_data = {"Episode Reward":score, "Total Steps": global_step}
         log_data = {**log_data, **clf_losses}
