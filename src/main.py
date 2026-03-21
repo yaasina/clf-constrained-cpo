@@ -167,7 +167,8 @@ def train(main_args):
         clf_opt.step()
 
         raw_uncert = dynamics.compute_uncertainty(batch["states"], batch["actions"])
-        uncert = dynamics.normalize_variance_dynamic(raw_uncert).detach().cpu().numpy()
+        uncert = dynamics.normalize_variance_dynamic(raw_uncert.mean()).detach()
+        print(uncert.shape)
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
