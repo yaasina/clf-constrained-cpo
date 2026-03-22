@@ -199,7 +199,7 @@ class DynamicsEnsemble(nn.Module):
         dt: float = 0.05,
         epochs_per_trajectory: int = 5,
         static_norm_k: float = 2.0,
-        dynamic_norm_c0: float = 0.05,
+        dynamic_norm_c: float = 0.05,
         dynamic_norm_alpha: float = 0.01,
         variance_buffer_size: int = 1000
     ) -> None:
@@ -220,7 +220,7 @@ class DynamicsEnsemble(nn.Module):
 
         # Register as buffer so it survives checkpoint/resume (M1)
         self.register_buffer(
-            "dynamic_norm_c", torch.tensor(dynamic_norm_c0, dtype=torch.float32)
+            "dynamic_norm_c", torch.tensor(dynamic_norm_c, dtype=torch.float32)
         )
 
         # Buffer to store variance history for median calculation
@@ -247,7 +247,7 @@ class DynamicsEnsemble(nn.Module):
             "dt": dt,
             "epochs_per_trajectory": epochs_per_trajectory,
             "static_norm_k": static_norm_k,
-            "dynamic_norm_c0": dynamic_norm_c0,
+            "dynamic_norm_c": dynamic_norm_c,
             "dynamic_norm_alpha": dynamic_norm_alpha,
             "variance_buffer_size": variance_buffer_size,
         }
@@ -357,6 +357,10 @@ class DynamicsEnsemble(nn.Module):
             + self.dynamic_norm_alpha * var_median
         )
         return var_median
+    
+    def update_uncertainty(self, state: torch.Tensor, action: torch.Tensor) -> None:
+        variance = self.compute_uncertainty(state, action, use_mc_dropout=False)
+        self.update_dynamic_normalization_parameter(variance)
 
     def compute_loss(
         self,

@@ -74,6 +74,8 @@ def train(main_args):
         ensemble_size=3, dt=0.05, learning_rate=1e-3,
     ).to(device)
 
+    uncert_update_freq = max_steps // dynamics.variance_buffer_size
+
     clf = CLFNetwork(
         state_dim=env.observation_space.shape[0], hidden_dim=64, learning_rate=1e-3,
         loss={"alpha1": 1.0, "alpha2": 1.0, "alpha3": 0.1, "alpha4": 0.1},
@@ -165,6 +167,12 @@ def train(main_args):
         clf_total_loss = clf_losses["loss"]
         clf_total_loss.backward()
         clf_opt.step()
+
+        print(dynamics.dynamic_norm_c)
+        for i in range(uncert_update_freq):
+            state_chunk = batch["states"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
+            action_chunk = batch["actions"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
+            dynamics.update_uncertainty(state_chunk, action_chunk)
 
         raw_uncert = dynamics.compute_uncertainty(batch["states"], batch["actions"])
         uncert = dynamics.normalize_variance_dynamic(raw_uncert.mean()).detach()
