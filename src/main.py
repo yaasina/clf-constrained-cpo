@@ -168,7 +168,7 @@ def train(main_args):
         clf_total_loss.backward()
         clf_opt.step()
 
-        print(dynamics.dynamic_norm_c)
+        # print(dynamics.dynamic_norm_c)
         for i in range(uncert_update_freq):
             state_chunk = batch["states"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
             action_chunk = batch["actions"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
