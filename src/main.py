@@ -182,7 +182,7 @@ def train(main_args):
 
         v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
         score = np.mean(scores)
-        log_data = {"Episode Reward":score, "Total Steps": global_step}
+        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item()}
         log_data = {**log_data, **clf_losses}
 
         print(log_data)
