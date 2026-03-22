@@ -172,7 +172,7 @@ def train(main_args):
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
 
-        v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert.cpu())
+        v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
         score = np.mean(scores)
         log_data = {"Episode Reward":score, "Total Steps": global_step}
         log_data = {**log_data, **clf_losses}
