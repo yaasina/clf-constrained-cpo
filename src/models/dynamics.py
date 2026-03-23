@@ -360,7 +360,8 @@ class DynamicsEnsemble(nn.Module):
     
     def update_uncertainty(self, state: torch.Tensor, action: torch.Tensor) -> None:
         variance = self.compute_uncertainty(state, action, use_mc_dropout=False)
-        self.update_dynamic_normalization_parameter(variance.mean())
+        for var in variance:
+            self.update_dynamic_normalization_parameter(var.mean())
 
     def compute_loss(
         self,
