@@ -350,6 +350,8 @@ class DynamicsEnsemble(nn.Module):
         self.variance_history.extend(flat_variance)
         if len(self.variance_history) > self.variance_buffer_size:
             self.variance_history = self.variance_history[-self.variance_buffer_size:]
+        else:
+            self.dynamic_norm_c.fill_(float(torch.tensor(self.variance_history).median().item()))
         var_median = float(torch.tensor(self.variance_history).median().item())
         # dynamic_norm_c is a registered buffer (M1)
         self.dynamic_norm_c.fill_(
@@ -362,6 +364,9 @@ class DynamicsEnsemble(nn.Module):
         variance = self.compute_uncertainty(state, action, use_mc_dropout=False)
         for var in variance:
             self.update_dynamic_normalization_parameter(var.mean())
+        median = float(torch.tensor(self.variance_history).median().item())
+
+        return median, self.dynamic_norm_c.item()
 
     def compute_loss(
         self,

@@ -169,10 +169,11 @@ def train(main_args):
         clf_opt.step()
 
         # print(dynamics.dynamic_norm_c)
-        for i in range(uncert_update_freq):
-            state_chunk = batch["states"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
-            action_chunk = batch["actions"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
-            dynamics.update_uncertainty(state_chunk, action_chunk)
+        # for i in range(uncert_update_freq):
+        #     state_chunk = batch["states"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
+        #     action_chunk = batch["actions"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
+        #     dynamics.update_uncertainty(state_chunk, action_chunk)
+        median, median_c = dynamics.update_uncertainty(batch["states"], batch["actions"])
 
         raw_uncert = dynamics.compute_uncertainty(batch["states"], batch["actions"])
         uncert = dynamics.normalize_variance_dynamic(raw_uncert.mean()).detach()
@@ -182,7 +183,7 @@ def train(main_args):
 
         v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
         score = np.mean(scores)
-        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item()}
+        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item(), "Median Variance": median, "Smoothed Variance": median_c}
         log_data = {**log_data, **clf_losses}
 
         print(log_data)
