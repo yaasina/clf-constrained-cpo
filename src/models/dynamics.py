@@ -343,7 +343,7 @@ class DynamicsEnsemble(nn.Module):
         return 1.0 - torch.exp(-self.static_norm_k * variance)
 
     def normalize_variance_dynamic(self, variance: torch.Tensor) -> torch.Tensor:
-        return variance / (variance + self.dynamic_norm_c)
+        return variance / (variance + self.dynamic_norm_c + 0.05)
 
     def update_dynamic_normalization_parameter(self, variance: torch.Tensor) -> float:
         flat_variance = variance.flatten().cpu().tolist()

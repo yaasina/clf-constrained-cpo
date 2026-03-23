@@ -176,14 +176,15 @@ def train(main_args):
         median, median_c = dynamics.update_uncertainty(batch["states"], batch["actions"])
 
         raw_uncert = dynamics.compute_uncertainty(batch["states"], batch["actions"])
-        uncert = dynamics.normalize_variance_dynamic(raw_uncert.mean()).detach()
+        mean_var = raw_uncert.mean()
+        uncert = dynamics.normalize_variance_dynamic(mean_var).detach()
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
 
         v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
         score = np.mean(scores)
-        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item(), "Median Variance": median, "Smoothed Variance": median_c}
+        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item(), "Mean Variance": mean_var, "Smoothed Variance": median_c}
         log_data = {**log_data, **clf_losses}
 
         print(log_data)
