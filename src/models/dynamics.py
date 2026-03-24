@@ -198,10 +198,9 @@ class DynamicsEnsemble(nn.Module):
         learning_rate: float = 1e-3,
         dt: float = 0.05,
         epochs_per_trajectory: int = 5,
-        static_norm_k: float = 2.0,
-        dynamic_norm_c: float = 0.05,
         dynamic_norm_alpha: float = 0.01,
-        variance_buffer_size: int = 1000
+        variance_tracker_size: int = 4000,
+        epsilon: float = 0.01
     ) -> None:
         super().__init__()
 
@@ -214,18 +213,9 @@ class DynamicsEnsemble(nn.Module):
         self.learning_rate = learning_rate
         self.dt = dt
         self._epochs_per_trajectory = epochs_per_trajectory
-        self.static_norm_k = static_norm_k
-        self.dynamic_norm_alpha = dynamic_norm_alpha
-        self.variance_buffer_size = variance_buffer_size
 
-        # Register as buffer so it survives checkpoint/resume (M1)
-        self.register_buffer(
-            "dynamic_norm_c", torch.tensor(dynamic_norm_c, dtype=torch.float32)
-        )
-
-        # Buffer to store variance history for median calculation
-        self.variance_history: List[float] = []
-
+        self.variance_tracker = VarianceTracker(tracker_size=variance_tracker_size, state_dim=state_dim, device='cpu', alpha=dynamic_norm_alpha)
+        self.epsilon = epsilon
         # Trajectory counter to know when to update variance norms
         self.trajectory_counter = 0
 
@@ -246,10 +236,9 @@ class DynamicsEnsemble(nn.Module):
             "learning_rate": learning_rate,
             "dt": dt,
             "epochs_per_trajectory": epochs_per_trajectory,
-            "static_norm_k": static_norm_k,
-            "dynamic_norm_c": dynamic_norm_c,
             "dynamic_norm_alpha": dynamic_norm_alpha,
-            "variance_buffer_size": variance_buffer_size,
+            "variance_tracker_size": variance_tracker_size,
+            "epsilon": epsilon,
         }
 
         self.models = nn.ModuleList([
@@ -338,35 +327,14 @@ class DynamicsEnsemble(nn.Module):
                     all_predictions.append(pred)
             stacked = torch.stack(all_predictions)
             return torch.var(stacked, dim=0)
-
-    def normalize_variance_static(self, variance: torch.Tensor) -> torch.Tensor:
-        return 1.0 - torch.exp(-self.static_norm_k * variance)
-
-    def normalize_variance_dynamic(self, variance: torch.Tensor) -> torch.Tensor:
-        return variance / (variance + self.dynamic_norm_c + 0.05)
-
-    def update_dynamic_normalization_parameter(self, variance: torch.Tensor) -> float:
-        flat_variance = variance.flatten().cpu().tolist()
-        self.variance_history.extend(flat_variance)
-        if len(self.variance_history) > self.variance_buffer_size:
-            self.variance_history = self.variance_history[-self.variance_buffer_size:]
-        else:
-            self.dynamic_norm_c.fill_(float(torch.tensor(self.variance_history).median().item()))
-        var_median = float(torch.tensor(self.variance_history).median().item())
-        # dynamic_norm_c is a registered buffer (M1)
-        self.dynamic_norm_c.fill_(
-            (1 - self.dynamic_norm_alpha) * self.dynamic_norm_c.item()
-            + self.dynamic_norm_alpha * var_median
-        )
-        return var_median
     
-    def update_uncertainty(self, state: torch.Tensor, action: torch.Tensor) -> None:
-        variance = self.compute_uncertainty(state, action, use_mc_dropout=False)
-        for var in variance:
-            self.update_dynamic_normalization_parameter(var.mean())
-        median = float(torch.tensor(self.variance_history).median().item())
+    def get_normalized_uncertainty(self, state: torch.Tensor, action: torch.Tensor) -> None:
+        raw_variance = self.compute_uncertainty(state, action, use_mc_dropout=False)
+        smoothed_median = self.variance_tracker.update(raw_variance)
 
-        return median, self.dynamic_norm_c.item()
+        normalized = raw_variance / (raw_variance + smoothed_median + self.epsilon)
+
+        return normalized.mean()
 
     def compute_loss(
         self,
@@ -538,6 +506,30 @@ class DynamicsEnsemble(nn.Module):
         model = cls(**hparams)
         model.load_state_dict(checkpoint["model_state_dict"])
         return model
+
+
+class VarianceTracker:
+    def __init__(self, state_dim: int, device: str = 'cpu', alpha: float = 0.01, tracker_size: int = 1000):
+        self.state_dim = state_dim
+        self.device = device
+        self.alpha = alpha
+        
+        self.smoothed_median = torch.zeros(state_dim, device=device)
+        self.initialized = False
+
+    def update(self, batch_variance: torch.Tensor) -> torch.Tensor:
+        # 1. Calculate the exact median of the current batch for each dimension
+        current_batch_median, _ = torch.median(batch_variance, dim=0)
+
+        # 2. Apply the EMA
+        if not self.initialized:
+            self.smoothed_median = current_batch_median
+            self.initialized = True
+        else:
+            self.smoothed_median = (self.alpha * current_batch_median) + \
+                                   ((1 - self.alpha) * self.smoothed_median)
+
+        return self.smoothed_median
 
 
 # Backward-compatibility aliases (old Lightning names still importable)

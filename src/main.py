@@ -71,10 +71,8 @@ def train(main_args):
 
     dynamics = DynamicsEnsemble(
         state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0], hidden_dim=64,
-        ensemble_size=3, dt=0.05, learning_rate=1e-3,
+        ensemble_size=3, dt=0.05, learning_rate=1e-3, variance_tracker_size=max_steps
     ).to(device)
-
-    uncert_update_freq = max_steps // dynamics.variance_buffer_size
 
     clf = CLFNetwork(
         state_dim=env.observation_space.shape[0], hidden_dim=64, learning_rate=1e-3,
@@ -173,18 +171,18 @@ def train(main_args):
         #     state_chunk = batch["states"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
         #     action_chunk = batch["actions"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
         #     dynamics.update_uncertainty(state_chunk, action_chunk)
-        median, median_c = dynamics.update_uncertainty(batch["states"], batch["actions"])
-
-        raw_uncert = dynamics.compute_uncertainty(batch["states"], batch["actions"])
-        mean_var = raw_uncert.mean()
-        uncert = dynamics.normalize_variance_dynamic(mean_var).detach()
+        uncert = dynamics.get_normalized_uncertainty(batch["states"], batch["actions"])
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
 
         v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
         score = np.mean(scores)
-        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item(), "Mean Variance": mean_var, "Smoothed Variance": median_c}
+
+        smoothed_median = dynamics.variance_tracker.smoothed_median
+        log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item()}
+        for i in range(len(smoothed_median)):
+            log_data[f"Variance Median Dim {i}"] = smoothed_median[i].item()
         log_data = {**log_data, **clf_losses}
 
         print(log_data)
