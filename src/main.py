@@ -64,11 +64,14 @@ def train(main_args):
     # for random seed
     np.random.seed(seed)
     random.seed(seed)
-
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
 
     equilibrium = torch.tensor([1.0, 0.0, 0.0])
 
     env = gym.make(env_name)
+    state, info = env.reset(seed=seed)
     agent = Agent(env, device, args)
 
 
