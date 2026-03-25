@@ -18,15 +18,18 @@ import time
 import gymnasium as gym
 
 def train(main_args):
-    algo_idx = 1
     agent_name = 'CPO'
     env_name = "Pendulum-v1"
     max_ep_len = 1000
     max_steps = 4000
     epochs = 250
     save_freq = 10
-    seed = algo_idx + 55
-    algo = '{}_{}'.format(agent_name, algo_idx)
+    seed = main_args["seed"]
+    relaxed = main_args["relaxed"]
+    if relaxed:
+        algo = agent_name + "_relaxed"
+    else:
+        algo = agent_name
     save_name = '_'.join(env_name.split('-')[:-1])
     if main_args["save_name"] is not None:
         save_name = main_args["save_name"]
@@ -37,8 +40,8 @@ def train(main_args):
         'agent_name':agent_name,
         'save_name': save_name,
         'discount_factor':0.99,
-        'hidden1':512,
-        'hidden2':512,
+        'hidden1':128,
+        'hidden2':128,
         'v_lr':2e-4,
         'cost_v_lr':2e-4,
         'value_epochs':200,
@@ -49,7 +52,7 @@ def train(main_args):
         'max_kl':0.001,
         'damping_coeff':0.01,
         'gae_coeff':0.97,
-        'cost_d':25.0/1000.0,
+        'cost_d':0,
     }
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
@@ -166,12 +169,10 @@ def train(main_args):
         clf_total_loss.backward()
         clf_opt.step()
 
-        # print(dynamics.dynamic_norm_c)
-        # for i in range(uncert_update_freq):
-        #     state_chunk = batch["states"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
-        #     action_chunk = batch["actions"][i*dynamics.variance_buffer_size:(i+1)*dynamics.variance_buffer_size]
-        #     dynamics.update_uncertainty(state_chunk, action_chunk)
-        uncert = dynamics.get_normalized_uncertainty(batch["states"], batch["actions"])
+        if relaxed:
+            uncert = dynamics.get_normalized_uncertainty(batch["states"], batch["actions"])
+        else:
+            uncert = torch.tensor(0.0, device=device, dtype=torch.float)
 
         # add cost to trajectories
         trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
@@ -207,6 +208,8 @@ if __name__ == "__main__":
     parser.add_argument('--test', action='store_true', help='For test.')
     parser.add_argument('--resume', type=int, default=0, help='type # of checkpoint.')
     parser.add_argument('--save_name', type=str, default=None, help='Name of base save directory')
+    parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility')
+    parser.add_argument('--relaxed', action='store_true', help='Flag to relax CPO constraint based on dynamical uncertainty')
     args = parser.parse_args()
     dict_args = vars(args)
     if args.test:
