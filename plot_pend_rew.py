@@ -8,8 +8,10 @@ cpo_rew = []
 relaxed_rew = []
 
 for i in range(1,11):
-    cpo_rew.append(np.load(os.path.join(curr_dir, "result", "Pendulum_CPO_" + str(i) + "_rewards.npz")))
-    relaxed_rew.append(np.load(os.path.join(curr_dir, "result", "Pendulum_CPO_relaxed_" + str(i) + "_rewards.npz")))
+    cpo_raw = np.load(os.path.join(curr_dir,"src", "result", "Pendulum_CPO_" + str(i) + "_rewards.npz"))
+    cpo_rew.append(cpo_raw[cpo_raw.files[0]])
+    relaxed_raw = np.load(os.path.join(curr_dir, "src", "result", "Pendulum_CPO_relaxed_" + str(i) + "_rewards.npz"))
+    relaxed_rew.append(relaxed_raw[relaxed_raw.files[0]])
 
 cpo_mean = np.mean(cpo_rew, axis=0)
 cpo_std = np.std(cpo_rew, axis=0)

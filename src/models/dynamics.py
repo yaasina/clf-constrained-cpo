@@ -200,7 +200,7 @@ class DynamicsEnsemble(nn.Module):
         epochs_per_trajectory: int = 5,
         dynamic_norm_alpha: float = 0.01,
         variance_tracker_size: int = 4000,
-        epsilon: float = 0.01
+        epsilon: float = 0.05
     ) -> None:
         super().__init__()
 
