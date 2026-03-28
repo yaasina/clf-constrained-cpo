@@ -34,7 +34,7 @@ def train(main_args):
     if main_args["save_name"] is not None:
         save_name = main_args["save_name"]
     else:
-        save_name = "result/{}_{}_{}".format(save_name, algo, seed)
+        save_name = "result/{}_{}_{}_{}".format(save_name, algo, seed, "v2")
     stop = False
     args = {
         'agent_name':agent_name,
@@ -147,11 +147,21 @@ def train(main_args):
         "next_states": torch.as_tensor(next_states, device=device, dtype=torch.float32)
         }
 
-        # calculate costs
+        # calculate costs and uncertaint
         clf.eval()
         dynamics.eval()
         costs = torch.relu(clf.compute_lie_derivative_with_action(batch["states"], batch["actions"], dynamics)).detach().cpu().numpy()
         cost_arr.append(costs)
+
+        if relaxed:
+            uncert = dynamics.get_normalized_uncertainty(batch["states"], batch["actions"])
+        else:
+            uncert = torch.tensor(0.0, device=device, dtype=torch.float)
+
+        # add cost to trajectories
+        trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
+
+        v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
 
         dynamics.train()
         dyn_opt.zero_grad()
@@ -172,17 +182,7 @@ def train(main_args):
         clf_total_loss.backward()
         clf_opt.step()
 
-        if relaxed:
-            uncert = dynamics.get_normalized_uncertainty(batch["states"], batch["actions"])
-        else:
-            uncert = torch.tensor(0.0, device=device, dtype=torch.float)
-
-        # add cost to trajectories
-        trajectories = list(zip(states, actions, rewards, costs, dones, fails, next_states))
-
-        v_loss, cost_v_loss, objective, cost_surrogate, kl, entropy = agent.train(trajs=trajectories, uncert=uncert)
         score = np.mean(scores)
-
         smoothed_median = dynamics.variance_tracker.smoothed_median
         log_data = {"Episode Reward":score, "Total Steps": global_step, "Uncertainty": uncert.item()}
         for i in range(len(smoothed_median)):
