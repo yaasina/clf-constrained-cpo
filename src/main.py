@@ -17,9 +17,11 @@ import copy
 import time
 import gymnasium as gym
 
+from env.quad.quad_rotor_still import QuadStillEnv
+
 def train(main_args):
     agent_name = 'CPO'
-    env_name = "Pendulum-v1"
+    env_name = main_args["env"]
     max_ep_len = 1000
     max_steps = 4000
     epochs = 250
@@ -68,12 +70,14 @@ def train(main_args):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-    equilibrium = torch.tensor([1.0, 0.0, 0.0])
-
     env = gym.make(env_name)
     state, info = env.reset(seed=seed)
     agent = Agent(env, device, args)
 
+    if env_name == 'Pendulum-v1':
+        equilibrium = torch.tensor([1.0, 0.0, 0.0])
+    else:
+        equilibrium = torch.zeros(env.observation_space.shape[0])
 
     dynamics = DynamicsEnsemble(
         state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0], hidden_dim=64,
@@ -193,6 +197,7 @@ def train(main_args):
         wandb.log(log_data)
         if (epoch + 1)%save_freq == 0:
             agent.save()
+            print(cost_arr)
             clf.save_checkpoint(save_name + "/clf.pt")
             dynamics.save_checkpoint(save_name + "/dynamics.pt")
             np.savez(save_name + "_costs.npz", cost_arr=cost_arr)
@@ -213,6 +218,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_name', type=str, default=None, help='Name of base save directory')
     parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility')
     parser.add_argument('--relaxed', action='store_true', help='Flag to relax CPO constraint based on dynamical uncertainty')
+    parser.add_argument('--env', type=str, default='Pendulum-v1', help='Environment name to train on')
     args = parser.parse_args()
     dict_args = vars(args)
     if args.test:
